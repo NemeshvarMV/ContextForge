@@ -13,11 +13,9 @@ from typing import Optional
 
 app = FastAPI(title="Enterprise Agentic RAG API")
 
-
 class QueryRequest(BaseModel):
     q: str
     thread_id: Optional[str] = "default_user"
-
 
 @app.get("/")
 def home():

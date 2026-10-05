@@ -1,32 +1,41 @@
 
 fastapi                     
 uvicorn[standard]           
-python-dotenv               
+python-dotenv              
 requests                    
-streamlit                    
-numpy                      
+streamlit                   
+numpy                       
+pytz                        
+nest-asyncio                
 
-
-google-generativeai         
+google-generativeai        
 langchain-google-genai      
 
-
 qdrant-client               
-flashrank                   
+flashrank                  
 
 langchain                   
 langgraph                   
 langchain-groq              
-pydantic>=2.0.0             
+langchain-community        
+langchain-openai            
+pydantic>=2.0.0           
 
-unstructured                
+unstructured               
 python-pptx                 
-python-docx                
+python-docx                 
 pypdf                       
-beautifulsoup4              
+beautifulsoup4             
 pdfplumber                  
-langsmith                  
-logfire[fastapi,requests]   
+
+langsmith                   
+logfire[fastapi,requests]  
 loguru                      
 
 sentence-transformers       
+
+nemoguardrails              
+langchain-nvidia-ai-endpoints 
+langchain-google-vertexai   
+
+portkey-ai                 

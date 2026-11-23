@@ -1,3 +1,7 @@
+# ============================================================
+# CRITICAL: logfire MUST be configured before ALL other imports
+# so that spans from all modules are captured from the start.
+# ============================================================
 import logfire
 import os
 from dotenv import load_dotenv
@@ -5,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logfire.configure(token=os.getenv("LOGFIRE_TOKEN"))
 
+# Now safe to import app modules - logfire is already active
 from fastapi import FastAPI, Response
 from app.agents.graph import rag_agent
 from app.guardrails.rails import initialize_rails, guard
@@ -12,7 +17,10 @@ from app.guardrails.rails import initialize_rails, guard
 from pydantic import BaseModel
 from typing import Optional
 
+
+# Initialize FastAPI
 app = FastAPI(title="Enterprise Agentic RAG API")
+
 
 @app.on_event("startup")
 def startup_event():
@@ -21,6 +29,7 @@ def startup_event():
 class QueryRequest(BaseModel):
     q: str
     thread_id: Optional[str] = "default_user"
+
 
 @app.get("/")
 def home():
@@ -55,6 +64,7 @@ def query(request: QueryRequest):
         "status": "Initializing Graph..."
     }
 
+    # Configuration for Memory (Thread ID)
     config = {"configurable": {"thread_id": thread_id}}
 
     try:

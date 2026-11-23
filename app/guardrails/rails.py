@@ -6,6 +6,12 @@ from app.config import settings
 from app.guardrails.colang_rules import COLANG_CONTENT, YAML_CONTENT, RAIL_INDICATORS
 
 
+OFF_TOPIC_REFUSAL = (
+    "I am an Enterprise IT Assistant for ContextForge. I can only answer technical questions covered by "
+    "our enterprise IT documentation (Cloud Infrastructure, DevOps & CI/CD, SRE & Incident Management, "
+    "and Cybersecurity). I cannot help with off-topic requests."
+)
+
 _rails: LLMRails | None = None
 _deterministic_responses: dict[str, str] = {}
 
@@ -17,8 +23,7 @@ def _normalize_message(message: str) -> str:
 def initialize_rails() -> None:
     """
     Build the NeMo LLMRails singleton at app startup.
-    Uses llama-3.1-8b-instant for fast intent classification at the gate —
-    the heavier llama-3.3-70b-versatile is reserved for the RAG pipeline.
+    Uses openai/gpt-oss-20b on Groq for fast intent classification at the gate.
     """
     global _deterministic_responses, _rails
 
@@ -85,7 +90,12 @@ def guard(message: str) -> tuple[bool, str | None]:
 
         if fired:
             logfire.info(f"🛡️ Guardrails fired | query='{message[:80]}'")
-            return True, content
+            import re
+            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            # If the output was a terse refusal or contained reasoning artifacts, deliver the canonical refusal
+            if not cleaned or any(x in cleaned.lower() for x in ("can't respond", "cannot respond", "off-topic", "refuse")):
+                return True, OFF_TOPIC_REFUSAL
+            return True, cleaned
 
         logfire.info("✅ Guardrails passed.")
         return False, None

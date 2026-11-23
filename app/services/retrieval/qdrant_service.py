@@ -16,13 +16,23 @@ def search_enterprise_knowledge(query: str, limit: int = 8):
     """
     try:
         query_vector = embed_query(query)
+        using_name = "gemini" if len(query_vector) == 3072 else "fallback"
 
-        response = client.query_points(
-            collection_name=settings.QDRANT_COLLECTION,
-            query=query_vector,
-            limit=limit,
-            with_payload=True # JSON
-        )
+        try:
+            response = client.query_points(
+                collection_name=settings.QDRANT_COLLECTION,
+                query=query_vector,
+                using=using_name,
+                limit=limit,
+                with_payload=True
+            )
+        except Exception:
+            response = client.query_points(
+                collection_name=settings.QDRANT_COLLECTION,
+                query=query_vector,
+                limit=limit,
+                with_payload=True
+            )
 
         results = []
         for res in response.points:

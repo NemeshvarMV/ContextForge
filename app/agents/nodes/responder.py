@@ -18,11 +18,31 @@ def generate_node(state: AgentState):
 
     user_msg = state["messages"][-1]["content"] if state["messages"] else ""
 
+    OFF_TOPIC_REFUSAL = (
+        "I am an Enterprise IT Assistant for ContextForge. I can only assist with technical topics covered by "
+        "our enterprise IT documentation (Cloud Infrastructure, DevOps & CI/CD, SRE & Incident Management, "
+        "and Cybersecurity). I cannot help with off-topic or general lifestyle requests."
+    )
+
+    if query == "OFF_TOPIC":
+        logfire.info("Responding with standard off-topic refusal.")
+        return {
+            "final_answer": OFF_TOPIC_REFUSAL,
+            "status": "Blocked by enterprise guardrails.",
+            "plan": state["plan"],
+            "messages": [{"role": "assistant", "content": OFF_TOPIC_REFUSAL}]
+        }
+
     if query == "CONVERSATIONAL":
         logfire.info("Generating conversational response using memory.")
         prompt = f"""
-        You are a friendly and helpful Enterprise AI Assistant.
-        Answer the user's latest message using the CONVERSATION HISTORY below.
+        You are an Enterprise IT Assistant for ContextForge.
+        Your role is to handle polite conversation (greetings, acknowledgments) or questions referencing prior conversation history.
+
+        STRICT BOUNDARIES:
+        - If the user is asking about cooking, recipes, coffee, sports, movies, or general non-IT topics, respond ONLY with:
+          "{OFF_TOPIC_REFUSAL}"
+        - Otherwise, answer the user politely using the CONVERSATION HISTORY below.
 
         CONVERSATION HISTORY:
         {history_str}
@@ -43,8 +63,15 @@ def generate_node(state: AgentState):
                 break
 
         prompt = f"""
-        You are a Senior Technical Architect.
+        You are a Senior Technical Architect and Enterprise IT Assistant for ContextForge.
         Answer the question using the TECHNICAL CONTEXT provided.
+
+        GROUNDING & BOUNDARY RULES:
+        1. Base your answer strictly on the facts present in the TECHNICAL CONTEXT.
+        2. If the TECHNICAL CONTEXT does not contain relevant information to answer the question, state clearly:
+           "I do not have documentation on that topic in my knowledge base. I can only answer questions covered by our verified enterprise IT documentation (GitLab, Microsoft, Google Cloud/SRE, and Atlassian)."
+        3. Never invent, extrapolate, or hallucinate technical procedures or policies not supported by the context.
+        4. Cite the company or source documentation when providing procedures.
 
         TECHNICAL CONTEXT:
         {full_context}

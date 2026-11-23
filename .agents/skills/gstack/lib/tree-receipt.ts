@@ -1,0 +1,267 @@
+/**
+ * tree-receipt — the tree-equality receipt (plan C3), behind
+ * bin/gstack-tree-receipt. Compares two committed heads (never a working
+ * tree: its fingerprint can name objects unreachable once the gate VM is
+ * gone), classifies the diff hunk by hunk with per-file-type rules, decides
+ * per gate whether its evidence is reusable, and refuses `eligible` when the
+ * recorded predecessor head moved. The repo's stamp rule wins: with
+ * `stamp_files` set, only those files can be stamps, and `stamp_patterns`
+ * (literal `{version}` templates) join the built-in stamp forms. Tree identity alone is not gate evidence:
+ * the receipt also compares the execution identity the gate ran under (from
+ * a `gstack-evidence bundle`) with the current one.
+ */
+import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { normalizeChangelog } from './changelog-check';
+import { foldIntoUnreleased, parseFragment, type Fragment } from './changelog-fragments';
+import { compareIdentity, executionIdentity, normalizeLockfile, readBundle, type EvidenceBundle, type ExecutionIdentity } from './evidence-bundle';
+import { parseUnifiedDiff, versionAtRef, type FileDiff, type GateAheadRecord } from './restamp';
+import { branchSides, stampOnlyLine, type BranchSide } from './stamp-only';
+import type { ResultCodeName } from './result-codes';
+import { matchesAny, type ShipPolicy } from './ship-policy';
+import { regeneratedAtBase } from '../crew/lib/version-gate-train';
+
+export type HunkClass = 'stamp' | 'changed';
+export interface FileVerdict { path: string; rule: string; verdict: HunkClass; residual?: string; line?: number }
+export interface GateVerdict { label: string; verdict: 'reusable' | 'rerun' | 'not-reusable'; reason: string; cmd_sha256?: string; command?: string }
+export interface TreeReceipt {
+  schema_version: 1;
+  gated_head: string; current_head: string; gated_tree: string; current_tree: string;
+  gated_wtree: string; current_wtree: string;
+  old_version: string | null; new_version: string | null;
+  predecessor: { pr: string | null; recorded_head: string | null; current_head: string | null; moved: boolean } | null;
+  files: FileVerdict[]; residual: string[];
+  tree: 'same-modulo-stamps' | 'changed';
+  identity: { gated: ExecutionIdentity | null; current: ExecutionIdentity; diffs: string[]; source: string };
+  gates: GateVerdict[];
+  gate_reuse: 'eligible' | 'not-eligible';
+  gate_reuse_reason: string;
+  rerun_command: string;
+  policy: string;
+  stamp_diff: string;
+  code?: ResultCodeName;
+}
+
+function git(cwd: string, args: string[]): string | null {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+  return r.status === 0 ? (r.stdout ?? '').replace(/\n$/, '') : null;
+}
+function blob(cwd: string, treeish: string, rel: string): string | null {
+  const r = spawnSync('git', ['show', `${treeish}:${rel}`], { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+  return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * Every file's verdict for one gated/current pair, with the changelog_fragments fold: a fragment deleted
+ * between the two is a stamp only when the CHANGELOG change is exactly those fragments folded under the new
+ * heading. gstack-tree-receipt and gstack-pregate clear both classify through this, so their rules agree.
+ */
+export function classifyFiles(repoRoot: string, fileDiffs: FileDiff[], gated: string, current: string, policy: ShipPolicy, versionRel: string, oldV: string | null, newV: string | null, side?: (rel: string) => BranchSide | undefined): FileVerdict[] {
+  const prefix = policy.changelog_fragments ? policy.changelog_fragments.dir.replace(/\/+$/, '') + '/' : null;
+  const folded = new Map<string, Fragment>();
+  for (const f of fileDiffs) {
+    if (!prefix || f.status !== 'D' || f.binary || f.modeChanged || !f.path.startsWith(prefix) || f.path.slice(prefix.length).includes('/') || !f.path.endsWith('.md')) continue;
+    const text = blob(repoRoot, gated, f.path);
+    const parsed = text === null ? null : parseFragment(f.path, text);
+    if (parsed && !('code' in parsed)) folded.set(f.path, parsed);
+  }
+  const fragments = [...folded.values()].sort((a, b) => (a.path < b.path ? -1 : 1));
+  const changelogVerdict = (f: FileDiff) => classifyFile(repoRoot, f, gated, current, policy, versionRel, oldV, newV, fragments, side);
+  const clDiff = fileDiffs.find(f => policy.changelog && f.path === policy.changelog);
+  const clStamp = !!clDiff && changelogVerdict(clDiff).verdict === 'stamp';
+  return fileDiffs.map((f): FileVerdict => {
+    if (!folded.has(f.path)) return f === clDiff ? changelogVerdict(f) : classifyFile(repoRoot, f, gated, current, policy, versionRel, oldV, newV, [], side);
+    return clStamp ? { path: f.path, rule: 'changelog_fragments', verdict: 'stamp' } : { path: f.path, rule: 'changelog_fragments', verdict: 'changed', residual: `deleted without its text folded under the new heading in ${policy.changelog ?? 'the CHANGELOG'}` };
+  });
+}
+
+/**
+ * Every removed/added pair differs only by stamp rewrites to the new version:
+ * the old version, or a tentative one (newer than it) the stamp_paths stage
+ * moved (#3512), each in a stamp form (`stampOnlyLine`, bounded by the fork version on the branch's own lines, where a
+ * declared placeholder may also move inside a stamp_patterns template, GST-1026).
+ */
+function stampOnlyHunks(hunks: FileDiff['hunks'], oldV: string, newV: string, templates: readonly string[], side?: BranchSide, placeholders: readonly string[] = []): { why: string; line: number } | null {
+  for (const h of hunks) {
+    if (h.removed.length !== h.added.length) return { why: `${h.removed.length} line(s) removed, ${h.added.length} added`, line: h.at };
+    for (let i = 0; i < h.removed.length; i++) {
+      const r = h.removed[i]!;
+      const a = h.added[i]!;
+      if (!stampOnlyLine(r, a, oldV, newV, templates, side, h.removedAt[i], placeholders)) return { why: `${JSON.stringify(r.trim().slice(0, 60))} -> ${JSON.stringify(a.trim().slice(0, 60))}`, line: h.at + i };
+    }
+  }
+  return null;
+}
+
+function jsonEqualModuloVersion(a: string | null, b: string | null, name: string): boolean {
+  if (a === null || b === null) return false;
+  return normalizeLockfile(name, a) === normalizeLockfile(name, b);
+}
+
+export function classifyFile(repoRoot: string, f: FileDiff, gated: string, current: string, policy: ShipPolicy, versionRel: string, oldV: string | null, newV: string | null, folded: readonly Fragment[] = [], side?: (rel: string) => BranchSide | undefined): FileVerdict {
+  const changed = (rule: string, residual: string, line = f.hunks[0]?.at): FileVerdict => ({ path: f.path, rule, verdict: 'changed', residual, line });
+  const stamp = (rule: string): FileVerdict => ({ path: f.path, rule, verdict: 'stamp' });
+  if (f.binary) return changed('binary', 'binary content differs');
+  if (f.modeChanged) return changed('mode', 'file mode changed');
+  if (f.status !== 'M') return changed('path', `${f.status === 'A' ? 'added' : f.status === 'D' ? 'deleted' : 'renamed'}`);
+  if (policy.stamp_files.length && !matchesAny(policy.stamp_files, f.path)) return changed('stamp_files', 'not in the repo\'s stamp_files allowlist');
+  const before = blob(repoRoot, gated, f.path);
+  const after = blob(repoRoot, current, f.path);
+  const base = path.basename(f.path);
+  if (f.path === versionRel) {
+    if (before !== null && after !== null && before.trim() === oldV && after.trim() === newV) return stamp('version-file');
+    if (versionRel.endsWith('.json') && jsonEqualModuloVersion(before, after, 'package-lock.json')) return stamp('version-manifest');
+    return changed('version-file', 'content beyond the version changed');
+  }
+  if (base === 'package-lock.json' || base === 'npm-shrinkwrap.json') {
+    return jsonEqualModuloVersion(before, after, base) ? stamp('lockfile-root-version') : changed('lockfile', 'a dependency entry changed (only the root version keys are stamps)');
+  }
+  if (base === 'bun.lock') return jsonEqualModuloVersion(before, after, base) ? stamp('lockfile-root-version') : changed('lockfile', 'a dependency entry changed');
+  if (base === 'package.json') {
+    try {
+      const a = JSON.parse(before ?? 'null'); const b = JSON.parse(after ?? 'null');
+      if (a && b) { delete a.version; delete b.version; if (JSON.stringify(a) === JSON.stringify(b)) return stamp('manifest-version'); }
+    } catch {}
+    return changed('manifest', 'a field other than version changed');
+  }
+  if (policy.changelog && f.path === policy.changelog) {
+    if (before !== null && after !== null && normalizeChangelog(foldIntoUnreleased(before, folded)) === normalizeChangelog(after)) return stamp(folded.length ? 'changelog-fragments' : 'changelog-heading');
+    return changed('changelog', folded.length ? 'entry text is not exactly the deleted fragments folded under the new heading' : 'entry text changed (only a heading move or re-heading is a stamp)');
+  }
+  const rule = matchesAny(policy.stamp_paths, f.path) ? 'stamp_paths' : matchesAny(policy.release_outputs, f.path) ? 'release_outputs' : matchesAny(policy.stamp_files, f.path) ? 'stamp_files' : null;
+  const own = rule ? side?.(f.path) : undefined;
+  if (oldV && newV && (oldV !== newV || own) && rule) {
+    const bad = stampOnlyHunks(f.hunks, oldV, newV, policy.stamp_patterns, own, policy.stamp_placeholders);
+    return bad ? changed(rule, bad.why, bad.line) : stamp(rule);
+  }
+  return changed('other', `${f.hunks.length} hunk(s) outside every stamp rule`);
+}
+
+export interface ReceiptOptions {
+  repoRoot: string; gated: string; current?: string; policy: ShipPolicy; policyLabel: string; versionRel?: string;
+  /** The base ref the gated head's own lines are read against (the fork-version bound, GST-963); without it every line keeps the old version's bound. */
+  baseRef?: string;
+  predecessor?: { pr: string | null; recordedHead: string | null; ref?: string | null; currentHead?: string | null };
+  bundlePath?: string; gh?: (args: string[]) => { ok: boolean; out: string }; env?: NodeJS.ProcessEnv; rerunCommand?: string;
+  /** Rerun the policy's release_tool (repo code: only under --allow-repo-commands) on the current head at its version; a release output it regenerates byte for byte is a stamp (GST-1176). */
+  regenerate?: boolean;
+}
+
+export function fromGateAhead(file: string): GateAheadRecord {
+  return JSON.parse(fs.readFileSync(file, 'utf8')) as GateAheadRecord;
+}
+
+function resolvePredecessor(o: ReceiptOptions): TreeReceipt['predecessor'] {
+  const p = o.predecessor;
+  if (!p) return null;
+  let currentHead: string | null = p.currentHead ?? null;
+  if (!currentHead && p.ref) currentHead = git(o.repoRoot, ['rev-parse', '--verify', '--quiet', `${p.ref}^{commit}`]);
+  if (!currentHead && p.pr) {
+    const gh = o.gh ?? ((args: string[]) => { const r = spawnSync('gh', args, { cwd: o.repoRoot, encoding: 'utf8', timeout: 60_000 }); return { ok: r.status === 0, out: r.stdout ?? '' }; });
+    const r = gh(['pr', 'view', p.pr, '--json', 'headRefOid']);
+    try { currentHead = r.ok ? (JSON.parse(r.out).headRefOid ?? null) : null; } catch { currentHead = null; }
+  }
+  const moved = !!(p.recordedHead && currentHead && p.recordedHead !== currentHead);
+  return { pr: p.pr, recorded_head: p.recordedHead, current_head: currentHead, moved };
+}
+
+export function buildReceipt(o: ReceiptOptions): TreeReceipt | { error: string; code: ResultCodeName } {
+  const gatedHead = git(o.repoRoot, ['rev-parse', '--verify', '--quiet', `${o.gated}^{commit}`]);
+  const currentHead = git(o.repoRoot, ['rev-parse', '--verify', '--quiet', `${o.current ?? 'HEAD'}^{commit}`]);
+  if (!gatedHead) return { error: `gated head ${o.gated} is not a committed head here (fetch it, or copy the gate-ahead worktree's object store)`, code: 'EVIDENCE_IDENTITY_UNKNOWN' };
+  if (!currentHead) return { error: `current head ${o.current ?? 'HEAD'} is not a commit`, code: 'EVIDENCE_IDENTITY_UNKNOWN' };
+  const gatedTree = git(o.repoRoot, ['rev-parse', `${gatedHead}^{tree}`])!;
+  const currentTree = git(o.repoRoot, ['rev-parse', `${currentHead}^{tree}`])!;
+  const gv = versionAtRef(o.repoRoot, gatedHead);
+  const cv = versionAtRef(o.repoRoot, currentHead);
+  const versionRel = o.versionRel ?? ('rel' in cv ? cv.rel : 'rel' in gv ? gv.rel : 'VERSION');
+  const oldV = 'version' in gv ? gv.version : null;
+  const newV = 'version' in cv ? cv.version : null;
+  const d = spawnSync('git', ['diff', '--unified=0', '--no-color', '--no-ext-diff', gatedHead, currentHead], { cwd: o.repoRoot, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024 });
+  if (d.status !== 0) {
+    const why = (d.error as NodeJS.ErrnoException | undefined)?.code ?? (d.signal ? `killed by ${d.signal}` : (d.stderr ?? '').trim().split('\n')[0]?.slice(0, 200) || `exit ${d.status}`);
+    return { error: `git diff ${gatedHead.slice(0, 12)} ${currentHead.slice(0, 12)} failed (${why}), so the changed files cannot be classified (GST-448)`, code: 'EVIDENCE_IDENTITY_UNKNOWN' };
+  }
+  const diffText = d.stdout.replace(/\n$/, '');
+  const classified = classifyFiles(o.repoRoot, parseUnifiedDiff(diffText), gatedHead, currentHead, o.policy, versionRel, oldV, newV, o.baseRef && oldV ? branchSides(o.repoRoot, o.baseRef, gatedHead, oldV) : undefined);
+  const rendered = o.regenerate && o.policy.release_tool && newV ? classified.filter(f => f.verdict === 'changed' && (f.rule === 'release_outputs' || (f.rule === 'path' && f.residual === 'added' && matchesAny(o.policy.release_outputs, f.path) && (!o.policy.stamp_files.length || matchesAny(o.policy.stamp_files, f.path))))).map(f => f.path) : [];
+  const regen = rendered.length ? regeneratedAtBase({ repoRoot: o.repoRoot, head: currentHead, baseVersion: blob(o.repoRoot, currentHead, 'VERSION') ?? newV!, tool: o.policy.release_tool!, outputs: rendered }) : null;
+  const files = classified.map((f): FileVerdict => {
+    if (!regen || !rendered.includes(f.path)) return f;
+    if (regen.kind === 'same' || (regen.kind === 'differs' && !regen.files.includes(f.path))) return { path: f.path, rule: 'release_tool', verdict: 'stamp' };
+    return { ...f, residual: `${f.residual}; ${regen.kind === 'error' ? regen.reason : `not what release_tool generates at ${newV}`}` };
+  });
+  const residual = files.filter(f => f.verdict === 'changed').map(f => f.path);
+  const stampFiles = files.filter(f => f.verdict === 'stamp').map(f => f.path);
+  const stampDiff = stampFiles.length ? (git(o.repoRoot, ['diff', '--no-color', '--no-ext-diff', gatedHead, currentHead, '--', ...stampFiles]) ?? '') : '';
+  const predecessor = resolvePredecessor(o);
+
+  const current = executionIdentity(o.repoRoot, currentHead, o.env);
+  let gated: ExecutionIdentity | null = null;
+  let bundle: EvidenceBundle | null = null;
+  let source = 'none (no evidence bundle; execution identity unknown)';
+  if (o.bundlePath) {
+    const read = readBundle(o.bundlePath);
+    if (!read.bundle) source = `invalid bundle: ${read.error?.message}`;
+    else if (read.bundle.repo.tree !== gatedTree) source = `bundle ${o.bundlePath} was produced on tree ${read.bundle.repo.tree.slice(0, 12)}, not the gated tree ${gatedTree.slice(0, 12)}`;
+    else { bundle = read.bundle; gated = bundle.identity; source = `bundle ${o.bundlePath} (producer ${bundle.producer.host}, ${bundle.produced_at})`; }
+  }
+  const diffs = gated ? compareIdentity(gated, current) : [];
+  const rerun = o.rerunCommand ?? 'gstack-evidence run --label <lane> -- <lane command>';
+
+  const gates: GateVerdict[] = [];
+  const sensitive = new Set(o.policy.stamp_sensitive_gates);
+  if (bundle) {
+    for (const lane of bundle.lanes) {
+      if (sensitive.has(lane.label)) gates.push({ label: lane.label, verdict: 'rerun', reason: 'stamp-sensitive (reads VERSION or generated bytes); always reruns on the stamped tree', cmd_sha256: lane.cmd_sha256, command: lane.command });
+      else if (!lane.verified) gates.push({ label: lane.label, verdict: 'not-reusable', reason: lane.reason ?? 'not verified', cmd_sha256: lane.cmd_sha256, command: lane.command });
+      else if (lane.exit !== 0) gates.push({ label: lane.label, verdict: 'not-reusable', reason: `recorded run exited ${lane.exit}`, cmd_sha256: lane.cmd_sha256, command: lane.command });
+      else if (diffs.length) gates.push({ label: lane.label, verdict: 'not-reusable', reason: `identity changed: ${diffs.join('; ')}`, cmd_sha256: lane.cmd_sha256, command: lane.command });
+      else gates.push({ label: lane.label, verdict: 'reusable', reason: 'identity matches; tree same modulo stamps', cmd_sha256: lane.cmd_sha256, command: lane.command });
+    }
+    for (const label of bundle.required_lanes) if (!bundle.lanes.some(l => l.label === label)) gates.push({ label, verdict: 'not-reusable', reason: 'required lane has no verified record in the bundle' });
+    for (const lane of bundle.imported) gates.push({ label: lane.label, verdict: 'not-reusable', reason: lane.reason ?? 'imported assertion, not verified' });
+  }
+
+  const treeVerdict: TreeReceipt['tree'] = residual.length ? 'changed' : 'same-modulo-stamps';
+  let reason = '';
+  if (treeVerdict === 'changed') reason = `tree changed: ${residual.join(', ')}`;
+  else if (predecessor?.moved) reason = `PREDECESSOR MOVED ${predecessor.recorded_head!.slice(0, 12)} -> ${predecessor.current_head!.slice(0, 12)}`;
+  else if (!bundle) reason = source;
+  else if (diffs.length) reason = diffs.join('; ');
+  else if (gates.some(g => g.verdict === 'not-reusable')) reason = gates.filter(g => g.verdict === 'not-reusable').map(g => `${g.label}: ${g.reason}`).join('; ');
+  else if (gates.length === 0 || gates.every(g => g.verdict === 'rerun')) reason = gates.length ? 'every lane is stamp-sensitive; nothing to reuse' : 'bundle lists no lanes';
+  const eligible = reason === '';
+  return {
+    schema_version: 1, gated_head: gatedHead, current_head: currentHead, gated_tree: gatedTree, current_tree: currentTree,
+    gated_wtree: gatedTree, current_wtree: currentTree, old_version: oldV, new_version: newV, predecessor,
+    files, residual, tree: treeVerdict, identity: { gated, current, diffs, source }, gates,
+    gate_reuse: eligible ? 'eligible' : 'not-eligible', gate_reuse_reason: eligible ? `reusable: ${gates.filter(g => g.verdict === 'reusable').map(g => g.label).join(',') || '-'}; rerun: ${gates.filter(g => g.verdict === 'rerun').map(g => g.label).join(',') || '-'}` : reason,
+    rerun_command: rerun, policy: o.policyLabel, stamp_diff: stampDiff,
+    code: eligible ? undefined : predecessor?.moved && treeVerdict !== 'changed' ? 'RESTAMP_PREDECESSOR_MOVED' : 'GATE_REUSE_NOT_ELIGIBLE',
+  };
+}
+
+/** The human rendering: identifiers first, one verdict line each for the tree and the gate reuse. */
+export function renderReceipt(r: TreeReceipt): string {
+  const lines = [
+    `gated head:    ${r.gated_head}`,
+    `current head:  ${r.current_head}`,
+    `gated tree:    ${r.gated_tree}`,
+    `current tree:  ${r.current_tree}`,
+    `version:       ${r.old_version ?? '-'} -> ${r.new_version ?? '-'}`,
+    `predecessor:   ${r.predecessor ? `#${r.predecessor.pr ?? '?'} recorded=${r.predecessor.recorded_head?.slice(0, 12) ?? '-'} current=${r.predecessor.current_head?.slice(0, 12) ?? 'unknown'}${r.predecessor.moved ? ' MOVED' : ''}` : 'none'}`,
+    `policy:        ${r.policy}`,
+    `identity:      ${r.identity.source}${r.identity.diffs.length ? ` — changed: ${r.identity.diffs.join('; ')}` : ''}`,
+  ];
+  for (const f of r.files) lines.push(`  ${f.verdict === 'stamp' ? 'stamp  ' : 'changed'} ${f.path} (${f.rule}${f.residual ? `: ${f.residual}` : ''})`);
+  for (const g of r.gates) lines.push(`  gate ${g.label}: ${g.verdict} (${g.reason})`);
+  if (r.stamp_diff) lines.push(r.stamp_diff.replace(/\n$/, ''));
+  lines.push(`TREE: ${r.tree === 'changed' ? `changed (${r.residual.join(', ')})` : 'same-modulo-stamps'}`);
+  if (r.predecessor?.moved) lines.push(`PREDECESSOR MOVED ${r.predecessor.recorded_head} -> ${r.predecessor.current_head} — fix: gstack-restamp --after ${r.predecessor.pr ?? '<pr>'} again (RESTAMP_PREDECESSOR_MOVED)`);
+  lines.push(r.gate_reuse === 'eligible'
+    ? `gate-reuse: eligible (${r.gate_reuse_reason})`
+    : `gate-reuse: not-eligible (${r.gate_reuse_reason}) — fix: ${r.rerun_command} (GATE_REUSE_NOT_ELIGIBLE)`);
+  return lines.join('\n') + '\n';
+}

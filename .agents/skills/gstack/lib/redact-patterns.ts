@@ -1,0 +1,1754 @@
+/**
+ * redact-patterns — the canonical redaction taxonomy.
+ *
+ * Single source of truth shared by `lib/redact-engine.ts`, `bin/gstack-redact`,
+ * `bin/gstack-redact-prepush`, and (via `scripts/resolvers/redact-doc.ts`) the
+ * generated SKILL.md docs for /spec, /ship, /cso, /document-release, and
+ * /document-generate.
+ *
+ * Design notes (locked in /plan-eng-review + two Codex passes):
+ *
+ *   - Three tiers. HIGH = genuinely-secret credentials (block). MEDIUM = PII,
+ *     legal/damaging, internal-leak, plus credential-shaped patterns that have
+ *     high false-positive rates (confirm via AskUserQuestion). LOW = surface only.
+ *   - NO wholesale MEDIUM->HIGH promotion on public repos (TENSION-2-followup).
+ *     Public repos get sterner per-finding confirmation, not auto-block. The
+ *     engine never mutates a finding's tier based on visibility.
+ *   - Tier-1 calibration: a gate that cries wolf gets ignored. Stripe
+ *     publishable keys, Google AIza keys, JWTs, and env-style KV are MEDIUM, not
+ *     HIGH (they are context-variable / high-FP). Only genuinely-secret
+ *     credentials block.
+ *   - ReDoS safety: every pattern here MUST be linear-time (no nested unbounded
+ *     quantifiers). `test/redact-pattern-lint.test.ts` fails CI on a catastrophic
+ *     form. The engine also enforces a hard input-size cap that fails CLOSED.
+ *   - Placeholder suppression is per-matched-span, not per-line.
+ *
+ * Pattern matching contract: every `regex` is used with the global+multiline
+ * flags the engine applies (`g`, `m`). Capture group 1, when present, is the
+ * "secret span" the engine masks and (for proximity rules) anchors on; when
+ * absent, match[0] is the span.
+ */
+
+export type Tier = "HIGH" | "MEDIUM" | "LOW";
+
+export type Category =
+  | "secret"
+  | "pii"
+  | "legal"
+  | "internal"
+  | "hygiene";
+
+export interface RedactPattern {
+  /** Stable dotted id, e.g. "aws.access_key". Used in findings + tests. */
+  id: string;
+  tier: Tier;
+  category: Category;
+  /** Human-readable one-liner for the findings table + docs. */
+  description: string;
+  /**
+   * The detection regex. Linter-enforced linear-time. The engine adds the
+   * `gm` flags; do not bake `g`/`m` into the source here (keeps `.source`
+   * clean for the docs table and avoids double-global bugs).
+   */
+  regex: RegExp;
+  /**
+   * Patterns whose redaction is unambiguous enough to offer one-keystroke
+   * auto-redact at MEDIUM tier (email / phone / ssn / cc). The engine wires
+   * the `<REDACTED-*>` replacement token from `redactToken`.
+   */
+  autoRedactable?: boolean;
+  /** Replacement token for auto-redact, e.g. "<REDACTED-EMAIL>". */
+  redactToken?: string;
+  /**
+   * Extra validators run AFTER the regex matches, ALL must pass for the match
+   * to count. Used for Luhn (credit cards), entropy (env-KV), checksum
+   * (crypto wallets), RFC1918-exclusion (public IPs), etc. Receives the
+   * matched secret span (group 1 or match[0]) and the full match array.
+   */
+  validate?: (span: string, match: RegExpExecArray, opts?: { sourcePath?: string }) => boolean;
+  /**
+   * Proximity requirement: the pattern only counts if `nearRegex` also matches
+   * within `nearWindow` chars of the match. Used for AWS secret keys (need
+   * `aws_secret_access_key` nearby) and Twilio auth tokens (need an SID nearby).
+   */
+  nearRegex?: RegExp;
+  nearWindow?: number;
+}
+
+// ── Validators ──────────────────────────────────────────────────────────────
+
+/** Luhn checksum — credit-card validity. Strips spaces/dashes first. */
+export function luhnValid(span: string): boolean {
+  const digits = span.replace(/[ \-]/g, "");
+  if (!/^\d{13,19}$/.test(digits)) return false;
+  let sum = 0;
+  let alt = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48;
+    if (alt) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+
+/** Shannon entropy in bits/char. Used to gate env-style KV (skip placeholders). */
+export function shannonEntropy(s: string): number {
+  if (!s.length) return 0;
+  const freq: Record<string, number> = {};
+  for (const ch of s) freq[ch] = (freq[ch] || 0) + 1;
+  let h = 0;
+  for (const ch in freq) {
+    const p = freq[ch] / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+// env.kv name-shape calibration: the regex's zero-or-more-prefix net matches
+// ANY identifier ending in a credential suffix, so `cacheKey:`, `sortKey:`,
+// `partitionKey:`, `hotkey:`, even `monkey:` with an 8+-char entropic value
+// all hit a MEDIUM confirm prompt — a gate that cries wolf gets ignored.
+// A matched name only counts when its shape is credential-semantic:
+//   (i)   suffix separated from the prefix by _ / - / .  (api_key, x-access-key,
+//         AUTH.TOKEN)
+//   (ii)  the whole name IS the bare suffix              (key:, token:)
+//   (iii) the name is ALL-CAPS env style                 (APIKEY=, MY_APIKEY=)
+//   (iv)  a lowercase/camel compound whose prefix ends in a credential word
+//         (apiKey, authToken, clientSecret, stripeApiKey) — cacheKey/sortKey/
+//         monkey have no credential prefix and are rejected.
+const ENV_KV_NAME =
+  /^(?:[ +-]?\+|[ +-]?-(?! [^ \t]))?[ \t]*(?:export[ \t]+)?["']?([A-Za-z0-9_.-]*?(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|DSN|AUTH|COOKIE|SESSION|PRIVATE))["']?[ \t]*[:=]/i;
+const ENV_KV_SUFFIX =
+  /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|DSN|AUTH|COOKIE|SESSION|PRIVATE)$/i;
+const ENV_KV_CRED_PREFIX =
+  /(api|auth|access|secret|private|app|client|server|master|admin|signing|encryption|session|csrf|jwt|oauth|bearer)$/i;
+
+/** True when the full env.kv match starts with a credential-shaped name. */
+export function isCredentialShapedEnvName(fullMatch: string): boolean {
+  const nameMatch = ENV_KV_NAME.exec(fullMatch);
+  if (!nameMatch) return false;
+  const name = nameMatch[1];
+  const suffixMatch = ENV_KV_SUFFIX.exec(name);
+  if (!suffixMatch) return false;
+  const prefix = name.slice(0, name.length - suffixMatch[1].length);
+  if (prefix === "") return true; // (ii) bare suffix
+  if (/[_.\-]$/.test(prefix)) return true; // (i) separator before suffix
+  if (!/[a-z]/.test(name)) return true; // (iii) ALL-CAPS env style
+  return ENV_KV_CRED_PREFIX.test(prefix); // (iv) credential-semantic compound
+}
+
+/** True when an IPv4 string is a public address (not RFC1918/loopback/etc). */
+export function isPublicIPv4(ip: string): boolean {
+  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const o = m.slice(1, 5).map(Number);
+  if (o.some((n) => n > 255)) return false;
+  const [a, b] = o;
+  if (a === 10) return false; // 10.0.0.0/8
+  if (a === 127) return false; // loopback
+  if (a === 0) return false; // this-network
+  if (a === 192 && b === 168) return false; // 192.168.0.0/16
+  if (a === 169 && b === 254) return false; // link-local
+  if (a === 172 && b >= 16 && b <= 31) return false; // 172.16.0.0/12
+  if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT 100.64.0.0/10
+  if (a >= 224) return false; // multicast / reserved
+  return true;
+}
+
+// EIP-55 checksum is out of scope (heavy); we require a length+charset match and
+// reject all-same-char vanity strings to cut the worst FPs.
+function looksLikeWallet(span: string): boolean {
+  if (/^0x[a-fA-F0-9]{40}$/.test(span)) {
+    // reject 0x000...0 / 0xfff...f style
+    const body = span.slice(2).toLowerCase();
+    return !/^(.)\1{39}$/.test(body);
+  }
+  if (span.startsWith("bc1")) return bech32ChecksumValid(span);
+  // base58 — length sanity only
+  return span.length >= 26 && span.length <= 62;
+}
+
+/**
+ * A bc1 address is bech32 (BIP 173) or bech32m (BIP 350): `bc`, the separator `1`, then data from a 32-letter alphabet
+ * with no `1`, `b`, `i` or `o`, ending in a six-letter checksum. A git sha that starts with `bc1` read as a wallet and
+ * was redacted out of `<sha>..<sha>` (Free Tests 41715139988, test/cso-cli.test.ts); the alphabet in the regex refuses
+ * most such shas, and the checksum, which a random string passes about once in 500 million tries, refuses the rest. Every real
+ * address carries a valid checksum, so none is lost.
+ */
+const BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32_GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+function bech32ChecksumValid(address: string): boolean {
+  const sep = address.lastIndexOf("1");
+  const hrp = [...address.slice(0, sep)].map((c) => c.charCodeAt(0));
+  const data = [...address.slice(sep + 1)].map((c) => BECH32_ALPHABET.indexOf(c));
+  if (sep < 1 || data.length < 6 || data.some((v) => v < 0)) return false;
+  let chk = 1;
+  for (const v of [...hrp.map((c) => c >> 5), 0, ...hrp.map((c) => c & 31), ...data]) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    BECH32_GENERATOR.forEach((g, i) => {
+      if ((top >>> i) & 1) chk ^= g;
+    });
+  }
+  return chk === 1 || chk === 0x2bc830a3;
+}
+
+// Compact log/backup stamps (`20260727202423` = YYYYMMDDHHMMSS) are bare digit
+// runs that the phone regex happily eats. Only a SEPARATOR-FREE 14-digit span
+// qualifies: E.164 tops out at 15 digits and real numbers carry a + or spacing,
+// so rejecting this shape costs no phone coverage.
+function looksLikeCompactTimestamp(span: string): boolean {
+  if (!/^\d{14}$/.test(span)) {
+    return false;
+  }
+  const n = (from: number, to: number) => Number(span.slice(from, to));
+  const [year, month, day, hour, minute, second] = [
+    n(0, 4),
+    n(4, 6),
+    n(6, 8),
+    n(8, 10),
+    n(10, 12),
+    n(12, 14),
+  ];
+  return (
+    year >= 1900 &&
+    year <= 2999 &&
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= 31 &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59
+  );
+}
+
+/**
+ * Bare integers that programs print as constants: 2^30 through 2^49 and each
+ * one minus one (`4294967296`, `2147483647`), and the 32-bit multipliers,
+ * offsets and primes of common hashes and PRNGs (Knuth's multiplicative hash,
+ * the golden-ratio constant, the glibc and Numerical Recipes LCGs, FNV-1a,
+ * MurmurHash2 and 3, the MT19937 seeder, the largest 32-bit prime). pii.phone.e164
+ * reads each as a bare 10-15 digit number. Only the exact separator-free value
+ * is exempt: the same digits with a `+`, spaces, dashes or dots still report,
+ * so an E.164 number, which carries its `+`, is never exempt.
+ */
+const NUMERIC_CONSTANTS: ReadonlySet<string> = new Set([
+  ...Array.from({ length: 20 }, (_, i) => 2n ** BigInt(30 + i)).flatMap((p) => [String(p), String(p - 1n)]),
+  "2654435761",
+  "2654435769",
+  "1103515245",
+  "1013904223",
+  "2166136261",
+  "1540483477",
+  "3432918353",
+  "2246822507",
+  "3266489909",
+  "1812433253",
+  "4294967291",
+]);
+
+export function isNumericConstant(span: string): boolean {
+  return NUMERIC_CONSTANTS.has(span);
+}
+
+/** Context window for pairing a normalized parcel ID with its punctuated form. */
+const PARCEL_CONTEXT_CHARS = 400;
+
+/**
+ * County tax-map parcel ID (APN). Ohio's dominant form is NN-NNNNNNN.NNN, and
+ * some counties use a hyphen before the 3-4 digit suffix instead of a dot.
+ */
+const PARCEL_PUNCT_RE = /\b\d{2}-\d{4,8}[.\-]\d{3,4}\b/g;
+
+/**
+ * A parcel ID reads as a national-format phone number to pii.phone.e164 — the
+ * same collision class as the digit-only UUID that `insideUuid` already guards.
+ * Land/title repos carry these by the hundred, so the false positives are not
+ * incidental: they arrive on every branch that touches title, and a guardrail
+ * that cries wolf on the domain's primary identifier trains people to wave the
+ * warning through, which is how a real HIGH finding eventually gets ignored.
+ *
+ * Deliberately narrow, in two tiers:
+ *
+ * 1. The DOTTED form is exempt on its own shape. No phone convention places a
+ *    dot before a trailing 3-4 digit group after a 4-8 digit middle, so this
+ *    cannot swallow a real number. The hyphen-only variants (22-0001-000) are
+ *    NOT exempted by shape — those genuinely are phone-shaped.
+ *
+ * 2. A DIGITS-ONLY span is phone-shaped in isolation, so it earns the exemption
+ *    only by evidence: it must be the exact digit-normalization of a punctuated
+ *    parcel ID within the surrounding window. Fixtures and marts always carry
+ *    the pair ({parcel_id: "12-3456789.000", norm: "123456789000"}), and a bare
+ *    phone number has no such twin nearby — so this reads the document's own
+ *    evidence rather than guessing from digits.
+ */
+export function looksLikeParcelId(span: string, match: RegExpExecArray): boolean {
+  if (/^\d{2}-\d{4,8}\.\d{3,4}$/.test(span)) return true;
+  if (!/^\d{10,14}$/.test(span)) return false;
+
+  const input = match.input ?? "";
+  const spanStartInMatch = match[1] !== undefined ? match[0].indexOf(match[1]) : 0;
+  const spanStart = match.index + Math.max(0, spanStartInMatch);
+  const spanEnd = spanStart + span.length;
+  const window = input.slice(
+    Math.max(0, spanStart - PARCEL_CONTEXT_CHARS),
+    spanEnd + PARCEL_CONTEXT_CHARS,
+  );
+
+  PARCEL_PUNCT_RE.lastIndex = 0;
+  let p: RegExpExecArray | null;
+  while ((p = PARCEL_PUNCT_RE.exec(window)) !== null) {
+    if (p[0].replace(/\D/g, "") === span) return true;
+  }
+  return false;
+}
+
+/**
+ * Vector geometry reads as a phone number to pii.phone.e164 (#2885, #2827).
+ * The pattern accepts `.` as a group separator, so a single float
+ * (`viewBox="0 0 581.66796875 695.65625"`) parses as 581 · 6679 · 6875, and a
+ * run of path coordinates (`37.6188 101.694`, `100 64.5326 100`) as four
+ * spaced groups. One rendered /diagram SVG carried 18 of these; a Figma icon
+ * carries dozens per path.
+ *
+ * Phone conventions put a separator between EVERY group, so a token with
+ * digits, one dot and digits is a decimal number, never a dotted phone
+ * (415.555.0123 has two dots in one token and stays flagged). Exempt a span
+ * whose space-separated tokens include at least one decimal and none with two
+ * dots. A leading `+` is the E.164 marker, so a span starting with it is a
+ * phone context and never exempt.
+ */
+export function looksLikeDecimalCoordinates(span: string): boolean {
+  if (span.startsWith("+")) return false;
+  const tokens = span.split(" ");
+  if (tokens.some((t) => t.split(".").length > 2)) return false;
+  return tokens.some((t) => /^\d+\.\d+$/.test(t));
+}
+
+/** Span start/end in `match.input`, derived exactly as redact-engine.ts does. */
+function spanBounds(match: RegExpExecArray): { start: number; end: number } {
+  const spanStartInMatch = match[1] !== undefined ? match[0].indexOf(match[1]) : 0;
+  const start = match.index + Math.max(0, spanStartInMatch);
+  return { start, end: start + (match[1] ?? match[0]).length };
+}
+
+/**
+ * True when a digit span is one side of a decimal number: `<digit>.` sits
+ * immediately before it or `.<digit>` immediately after. pii.cc's `\b` stops
+ * at the dot, so the 14-digit fraction of `492.34399999999994` in an
+ * .excalidraw scene is a Luhn candidate, and a random digit run passes Luhn
+ * about one time in ten (#2827). A card number in prose is never glued to a
+ * decimal point; a sentence-ending period has no digit after it and stays
+ * flagged.
+ */
+export function insideDecimalNumber(match: RegExpExecArray): boolean {
+  const input = match.input ?? "";
+  const { start, end } = spanBounds(match);
+  const digit = (i: number) => i >= 0 && i < input.length && input[i] >= "0" && input[i] <= "9";
+  return (input[start - 1] === "." && digit(start - 2)) || (input[end] === "." && digit(end + 1));
+}
+
+/**
+ * JSON keys whose unquoted integer value is a random seed, nonce or epoch
+ * timestamp. Excalidraw writes three per element (`"seed":1808177121`,
+ * `"versionNonce":1365644783`, `"updated":1791059590857`), and pii.phone.e164
+ * reads each as a bare 10-13 digit number: 92 per /diagram scene (#2827).
+ */
+const NUMERIC_METADATA_KEY =
+  /"[A-Za-z0-9_]*(?:seed|nonce|updated|created|timestamp)(?:at|_at|ms|_ms)?"[ \t]*:[ \t]*$/i;
+
+/**
+ * True when a digit-only span is the unquoted JSON value of a seed, nonce or
+ * timestamp key. The evidence is the key, not the digits: the same number
+ * under `"phone":` still reports.
+ */
+export function isNumericMetadataValue(span: string, match: RegExpExecArray): boolean {
+  if (!/^\d+$/.test(span)) return false;
+  const input = match.input ?? "";
+  const { start } = spanBounds(match);
+  const lineStart = input.lastIndexOf("\n", start - 1) + 1;
+  return NUMERIC_METADATA_KEY.test(input.slice(Math.max(lineStart, start - 80), start));
+}
+
+/**
+ * GitHub Actions run and job ids are bare 10-12 digit integers, so
+ * pii.phone.e164 reads them as phone numbers. A published eval report prints
+ * the run id inside the command the reader copies
+ * (`bun run eval:pass-rates --run 37235771700`), and redacting it breaks that
+ * command. Only the position decides: a run/job flag (`--run 37235771700`,
+ * `--job=111534615007`), a `gh run view|watch|rerun|download|cancel`
+ * argument, an `actions/runs/<id>` or `/job/<id>` URL segment (with or
+ * without a host: `actions/runs/` at the line start or after whitespace,
+ * `/`, `(`, `[`, `<` or a quote, so `sales-actions/runs/<n>` is not one),
+ * a `run_id` / `job_id` key, or any 11- or 12-digit id of a
+ * `runs=<id>/<attempt>[,<id>/<attempt>…]` list (`run=` too), the receipt a
+ * CI carry or run clear prints (lib/run-evidence.ts runReceiptFields); the
+ * `/<attempt>` of one to three digits after every id is what tells that list
+ * from a number (GST-1227). An 11-digit id (every GitHub Actions run id since
+ * 2025) also counts right after a run word on the same line, the way a ship
+ * receipt, a READY block or an approval record names one (`screen 40477638211
+ * GREEN`, `gate=40323989742`, `rerun passed 40287239206`, `run #19368712345`);
+ * generic words (id, job, attempt, workflow) exempt nothing, since `customer id
+ * 14155551234` is a number. A national number written without its `+` right
+ * after a run word (`failed 14155551234`) is the accepted residual of the
+ * owner's ruling that a run id is not a phone number; gstack-post's chained-id
+ * allowlist reads the same position the same way. The same digits anywhere
+ * else still report.
+ */
+const CI_ID_POSITION_BEFORE =
+  /(?:--(?:run|job)(?:-id)?(?:[ \t]+|[ \t]*=[ \t]*)|\bgh[ \t]+run[ \t]+(?:view|watch|rerun|download|cancel)[ \t]+|(?:^|[\s\/(\[<"'])actions\/runs\/|\/jobs?\/|(?:run|job)_id["']?[ \t]*[:=][ \t]*["']?)$/i;
+const CI_RUN_LIST = /(?<![\w-])runs?=\d{11,12}\/\d{1,3}(?:,\d{11,12}\/\d{1,3})*(?![\w\/])/gi;
+/** A run word with an optional ':' '#' '=' right before an 11-digit token; shared with gstack-post's chained-id allowlist. */
+export const CI_RUN_WORD_BEFORE = /\b(?:runs?|screens?|gates?|backstop|bisect|rerun|dispatch(?:ed)?|failed|passed)\s*[:#=]?\s*$/i;
+export function isCiRunIdentifier(span: string, match: RegExpExecArray): boolean {
+  if (!/^\d+$/.test(span)) return false;
+  const input = match.input ?? "";
+  const { start } = spanBounds(match);
+  const lineStart = input.lastIndexOf("\n", start - 1) + 1;
+  const before = input.slice(Math.max(lineStart, start - 80), start);
+  if (CI_ID_POSITION_BEFORE.test(before) || (span.length === 11 && CI_RUN_WORD_BEFORE.test(before))) return true;
+  const lineEnd = input.indexOf("\n", start);
+  const line = input.slice(lineStart, lineEnd < 0 ? input.length : lineEnd);
+  const at = start - lineStart;
+  return [...line.matchAll(CI_RUN_LIST)].some(m => m.index! < at && at + span.length <= m.index! + m[0].length);
+}
+
+/**
+ * The owner's grant of one scoped fix-check is recorded as `review_loop_grant <stop head sha>`, and an accepted stop as
+ * `review_loop_exception <sha>` (docs/review-policy.md). About one 12-character sha in 300 is all digits
+ * (`367120488513`), and pii.phone.e164 read it as a phone number, so gstack-approvals refused the owner's grant
+ * (APPROVAL_RECORD_SECRET; Free Tests 41667825418, 41766865679). Only the position decides: a digits-only span right
+ * after one of those two tokens and a space, `=` or `:`. The same digits anywhere else, or a number with a `+`,
+ * spaces or dashes after the token, still report.
+ */
+const REVIEW_LOOP_SHA_BEFORE = /\breview_loop_(?:grant|exception)(?:[ \t]+|[ \t]*[:=][ \t]*)$/;
+function isReviewLoopSha(span: string, match: RegExpExecArray): boolean {
+  if (!/^\d+$/.test(span)) return false;
+  const input = match.input ?? "";
+  const { start } = spanBounds(match);
+  return REVIEW_LOOP_SHA_BEFORE.test(input.slice(Math.max(0, start - 40), start));
+}
+
+/**
+ * A four-part version (MAJOR.MINOR.PATCH.BUILD: .NET assembly versions,
+ * gstack's own VERSION) is byte-for-byte a dotted quad, and `1.128.1.0` is a
+ * public address, so `"version": "1.128.1.0"` raised pii.ip_public on every
+ * release (#2784). The value cannot decide it, so only the declaration
+ * immediately before it on the same line can: a `version` key or word
+ * (`"version": "`, `app_version = `, `<Version>`, `AssemblyVersion("`,
+ * `version `), or a Keep a Changelog heading `## [1.2.3.4]`. The same digits
+ * after `host:`, `server = ` or in prose that merely mentions a version still
+ * report, and the pre-push hook's VERSION-file rule (#2856) is unchanged.
+ */
+const VERSION_DECLARATION_BEFORE =
+  /(?:\b[Vv]ersion|\bVERSION|[a-z0-9_]Version|[_-][Vv]ersion|_VERSION)["'\]]?(?:[ \t]*[:=(>][ \t]*|[ \t]+)["']?$/;
+const CHANGELOG_HEADING_BEFORE = /^#{1,6}[ \t]+\[$/;
+/**
+ * gstack names its own release right before the quad: `gstack 1.94.4.0`, `upgraded gstack from 1.93.14.0`, and the
+ * install check's trailer `gstack: ok 1.94.4.0 for=ship` or `gstack: fail claude,codex (1.93.37.0)`, which every lane
+ * report and PR body quotes (GST-1204). Only a quad shaped like a gstack release (major 0-2) counts, so `gstack 8.8.8.8`,
+ * `my-gstack 1.94.4.0`, `gstack-proxy 1.128.1.0` or `gstack talks to 8.8.8.8` still report.
+ */
+const GSTACK_RELEASE = /^[0-2]\./;
+const GSTACK_NAMED_BEFORE = /(?<![\w./-])gstack(?:[ \t]*:[ \t]*(?:ok|fail)(?:[ \t]+[a-z0-9_,-]+)?[ \t]+\(?|[ \t]+(?:from[ \t]+)?)$/;
+/** The second end of a range (`X to Y`, `X-Y`) whose first end is a declared version with the same major. */
+const RANGE_END_BEFORE = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[ \t]*(?:to|through|-|\u2013)[ \t]*$/;
+function declaredAt(input: string, start: number, end: number, range: boolean): boolean {
+  const lineStart = input.lastIndexOf("\n", start - 1) + 1;
+  const before = input.slice(Math.max(lineStart, start - 48), start);
+  const span = input.slice(start, end);
+  if (VERSION_DECLARATION_BEFORE.test(before) || (GSTACK_NAMED_BEFORE.test(before) && GSTACK_RELEASE.test(span))) return true;
+  if (CHANGELOG_HEADING_BEFORE.test(input.slice(lineStart, start)) && input[end] === "]") return true;
+  const first = range ? RANGE_END_BEFORE.exec(before) : null;
+  if (!first || first[1]!.split(".")[0] !== span.split(".")[0]) return false;
+  const firstStart = start - before.length + first.index;
+  return declaredAt(input, firstStart, firstStart + first[1]!.length, false);
+}
+export function isDeclaredVersion(match: RegExpExecArray): boolean {
+  const { start, end } = spanBounds(match);
+  return declaredAt(match.input ?? "", start, end, true);
+}
+
+/**
+ * A quad written to or read from a VERSION file, or set beside a semver (GST-2047): the file's name, alone or ending a
+ * path, or a three-part version (`v1.97.2`, `1.98.0-rc.1`) within a short gap of the quad on the same line
+ * (`path.join(dir, "VERSION"), "1.98.0.0\n"`, `echo 1.98.0.0 > VERSION`, `v1.97.2 to 1.98.0.0`). The gap holds only
+ * quotes, brackets, commas, arrows, spaces, a `\n` escape or the word `to`, so a quad set apart by any other word
+ * (`VERSION bumped; the DNS server 8.8.8.8`, `node 22.11.0 talks to 8.8.8.8`) still reports, and so does a quad
+ * next to another quad. A file named VERSION that holds only the quad is one too; a VERSION file with any other line is
+ * not a whole-file version (#2856), so each of its quads reports.
+ */
+const VERSION_GAP = String.raw`(?:[^A-Za-z0-9\n]|\\[nrt]|\bto\b){0,12}`;
+const VERSION_NEIGHBOUR = String.raw`(?:(?<![\w.-])(?:[\w.-]+\/)*VERSION(?![\w.-])|(?<![\w.])v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?(?![\w.-]))`;
+const VERSION_NEIGHBOUR_BEFORE = new RegExp(VERSION_NEIGHBOUR + VERSION_GAP + "$");
+const VERSION_NEIGHBOUR_AFTER = new RegExp("^" + VERSION_GAP + VERSION_NEIGHBOUR);
+export function isVersionContext(match: RegExpExecArray, sourcePath?: string): boolean {
+  const input = match.input ?? "";
+  const { start, end } = spanBounds(match);
+  const lineStart = input.lastIndexOf("\n", start - 1) + 1;
+  const lineEnd = input.indexOf("\n", end);
+  const line = input.slice(lineStart, lineEnd < 0 ? input.length : lineEnd);
+  if (sourcePath && /(?:^|[\\/])VERSION$/.test(sourcePath) && input.trim() === input.slice(start, end)) return true;
+  return VERSION_NEIGHBOUR_BEFORE.test(input.slice(Math.max(lineStart, start - 80), start)) || VERSION_NEIGHBOUR_AFTER.test(line.slice(end - lineStart, end - lineStart + 80));
+}
+
+// ── Placeholder suppression (per-matched-span, NOT per-line) ─────────────────
+
+/**
+ * A finding is suppressed only if the MATCHED SPAN itself is a placeholder
+ * form — not merely co-located on a line with the word EXAMPLE. This is the
+ * tightened rule from the Codex review (line-based suppression was dangerous).
+ */
+// Structural placeholder forms — apply to ANY span (including URLs).
+const PLACEHOLDER_STRUCTURAL = [
+  /^your[_-]/i,
+  /^<[^>]*>$/, // <REDACTED-FOO>, <your-key>
+  /^\*+$/, // all-asterisks mask
+  /^x{6,}$/i, // xxxxxx mask
+];
+
+// Substring placeholder words (example/test/dummy/...). These are NOT applied to
+// compound spans containing `://` or `@`, because a legit URL/host can contain
+// "example" (e.g. db.example.com) without being a placeholder secret. AWS docs
+// keys like AKIAIOSFODNN7EXAMPLE are bare tokens, so the guard still catches them.
+const PLACEHOLDER_SUBSTRING = [
+  /example/i, // AKIAIOSFODNN7EXAMPLE etc — AWS docs convention
+  /^pass(word)?$/i, // literal PASSWORD/pass in URL-format doc comments
+  /^changeme$/i,
+  /^redacted/i,
+  /^placeholder/i,
+  /^dummy/i,
+  /^fake/i,
+  /test[_-]?(key|token|secret)/i,
+];
+
+export function isPlaceholderSpan(span: string): boolean {
+  if (PLACEHOLDER_STRUCTURAL.some((re) => re.test(span))) return true;
+  const isCompound = span.includes("://") || span.includes("@");
+  if (!isCompound && PLACEHOLDER_SUBSTRING.some((re) => re.test(span))) return true;
+  return false;
+}
+
+/** Canonical 8-4-4-4-12 hex UUID. Global: a line may hold several. */
+const UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+
+/** How far either side of a span to look for an enclosing UUID. A UUID is 36
+ * chars, so 40 covers one that starts immediately before the span. Bounded so
+ * this stays cheap on a multi-megabyte buffer. */
+const UUID_CONTEXT_CHARS = 40;
+
+/**
+ * True when an `internal.hostname` span is really the tail of a dotenv
+ * FILENAME (`.env.local`, `.env.staging`, `.env.prod`) rather than a host.
+ *
+ * The hostname pattern ends in `.local|.prod|.staging|…`, so `.env.local`
+ * matches on `env.local` — a false positive on one of the most commonly
+ * committed filenames there is. It arrives via npm scripts
+ * (`--env-file=.env.local`), READMEs, `.gitignore` and setup docs, i.e. on
+ * ordinary branches that leak nothing, which is the noise that teaches people
+ * to skim past MEDIUM findings.
+ *
+ * Deliberately narrow, in the same spirit as `insideUuid`: it exempts ONLY a
+ * span beginning `env.` that is immediately preceded by a dot — the literal
+ * `.env.<suffix>` form. A real host still reports, `api.corp` and
+ * `build-7.internal` included, and so does `myenv.local`, which is not a
+ * dotenv file.
+ */
+export function isDotenvFilename(match: RegExpExecArray): boolean {
+  const input = match.input ?? "";
+  const span = match[1] ?? match[0];
+  if (!/^env\./i.test(span)) return false;
+  // Mirror the engine: capture group 1 when present, else the whole match.
+  const spanStartInMatch = match[1] !== undefined ? match[0].indexOf(match[1]) : 0;
+  const spanStart = match.index + Math.max(0, spanStartInMatch);
+  return spanStart > 0 && input[spanStart - 1] === ".";
+}
+
+/** A trailing run of file extensions that are not top-level domains (checked
+ * against the IANA root zone list, 2026-10-28). Extensions that are also TLDs
+ * (`.md`, `.py`, `.sh`, `.rs`, `.so`, `.zip`, `.mov`, `.map`) are left out on
+ * purpose. */
+const NON_TLD_EXTENSIONS = /(?:\.(?:json|jsonc|jsonl|ndjson|ya?ml|toml|lock|txt|csv|tsv|log|ini|cfg|conf|xml|html?|[mc]?js|jsx|tsx?|tgz|gz|tar|bz2|xz|zst|whl|jar|gem|nupkg|deb|rpm|wasm|svg|png|jpe?g|pdf|patch|diff))+$/i;
+
+/**
+ * True when a pii.email span is a filename with an `@` in it rather than an
+ * address: `terminal-bench@2.0.json`, `lodash@4.17.21.tgz`,
+ * `eslint-config@next.yaml`. The package@version convention puts a version or
+ * tag after the `@`, so either sign decides: the "domain" ends in file
+ * extensions no TLD uses and what precedes them cannot be a domain (one dotless
+ * label or a dotted version), or it is a dotted version (two or more all-digit
+ * labels) followed by an extension that doubles as a TLD (`a@1.2.md`). A file
+ * named after an address (`jane@acme.com.json`), `user@163.com`,
+ * `alice@1.2.com` and an address at a TLD that doubles as an extension
+ * (`dev@acme.sh`, `ops@acme.md`) still report.
+ */
+export function looksLikeAtFilename(span: string): boolean {
+  const domain = span.slice(span.lastIndexOf("@") + 1);
+  const stem = domain.replace(NON_TLD_EXTENSIONS, "");
+  if (stem !== domain) return !/\.[A-Za-z]{2,}$/.test(stem);
+  return /^\d+(?:\.\d+)+\.(?:md|py|sh|rs|so|zip|mov|map)$/i.test(domain);
+}
+
+/** Extensions that mark a `<name>.local.<ext>` span as a file. Closed on
+ * purpose: `.md` is also Moldova's TLD, but no internal suffix sits in front
+ * of a public one, so after `.local` it can only be an extension. */
+const LOCAL_CONFIG_EXTENSIONS = /^\.(?:md|json|jsonc|ya?ml|toml|ini|conf|txt)\b/i;
+
+/**
+ * True when an `internal.hostname` span is the stem of a per-machine config
+ * FILENAME (`CLAUDE.local.md`, `settings.local.json`, `values.staging.yaml`)
+ * rather than a host (#2962). The pattern's `\b` stops at the dot before the
+ * extension, so `CLAUDE.local.md` reported `CLAUDE.local`. Claude Code's own
+ * per-user files are named this way, so any decision or doc that mentions
+ * them failed closed in the non-interactive stores.
+ *
+ * Exempts ONLY a span immediately followed by `.<known extension>` and a word
+ * boundary. `printer.local.` at the end of a sentence still reports, and so
+ * do `printer.local`, `printer.local/md` and `printer.local.mdx`.
+ */
+export function isLocalConfigFilename(match: RegExpExecArray): boolean {
+  const { end } = spanBounds(match);
+  return LOCAL_CONFIG_EXTENSIONS.test((match.input ?? "").slice(end, end + 8));
+}
+
+/**
+ * True when the matched span sits ENTIRELY inside a UUID.
+ *
+ * Digit-only UUIDs — `00000000-0000-0000-0000-000000000000`,
+ * `11111111-1111-…` — are the standard fixture shape in test suites, and their
+ * digit runs collide with both the credit-card and phone patterns: a 16-digit
+ * slice of one is Luhn-valid often enough to matter, and the hyphen groups read
+ * as national phone formatting. Observed live: 14 of 21 MEDIUM findings on one
+ * ordinary branch were this, all from test files. That volume is what stops
+ * people reading MEDIUM output at all, so it costs real detection elsewhere.
+ *
+ * Containment must be TOTAL, deliberately. A span merely adjacent to or
+ * overlapping a UUID still reports — suppression is the exception, so it may
+ * only fire when the whole match is demonstrably UUID interior.
+ *
+ * Takes the match (not just the span) because the decision needs surrounding
+ * context; span offset is derived exactly as redact-engine.ts derives it, so
+ * the two cannot disagree about where the span begins.
+ */
+export function insideUuid(match: RegExpExecArray): boolean {
+  const input = match.input ?? "";
+  // Mirror the engine: capture group 1 when present, else the whole match.
+  const spanStartInMatch = match[1] !== undefined ? match[0].indexOf(match[1]) : 0;
+  const spanStart = match.index + Math.max(0, spanStartInMatch);
+  const spanEnd = spanStart + (match[1] ?? match[0]).length;
+
+  const from = Math.max(0, spanStart - UUID_CONTEXT_CHARS);
+  const window = input.slice(from, spanEnd + UUID_CONTEXT_CHARS);
+
+  UUID_RE.lastIndex = 0;
+  let u: RegExpExecArray | null;
+  while ((u = UUID_RE.exec(window)) !== null) {
+    const uuidStart = from + u.index;
+    const uuidEnd = uuidStart + u[0].length;
+    if (spanStart >= uuidStart && spanEnd <= uuidEnd) return true;
+  }
+  return false;
+}
+
+// ── The taxonomy ─────────────────────────────────────────────────────────────
+
+/**
+ * URL-embedded passwords that are interpolation forms, not credentials:
+ * `${identifier}` (bash or JS template, any case) or bare `$UPPER_SNAKE`
+ * (shell convention). Bare lowercase `$word` stays BLOCKED — a real password
+ * that merely starts with `$` (e.g. `$` + a dictionary word) must not slip
+ * through the HIGH gate just because it looks vaguely variable-shaped.
+ * Shared by db.url_with_password and creds.basic_auth_url so the two
+ * validators cannot drift.
+ */
+// Fully-braced `${...}` spanning the whole password segment is template code
+// regardless of content — `${dbPass}` and `${encodeURIComponent(dbPass)}`
+// alike (the identifier-only form flagged the DSN-encoding call site as a
+// pushed secret). Bare `$word` stays uppercase-only: `$hunter2` must block.
+const INTERPOLATED_PASSWORD_RE = /^(\$\{.+\}|\$[A-Z_][A-Z0-9_]*)$/;
+// URL-password placeholders are matched by EXACT token, never by shape or
+// substring. A shape rule (`/^[A-Z][A-Z0-9_]*$/`) waved through real all-caps
+// secrets like `PROD2026SECRET`; a substring rule would let `PROD2026SECRET`
+// slip because it contains `SECRET`. So this is an anchored, hand-curated set
+// of the doc-comment conventions (postgres://USER:PASSWORD@host) only. Compared
+// case-sensitively against the raw span: the convention is ALL CAPS, and a
+// lowercase `password`/`pass` at this position is a real (terrible) credential
+// that must still block.
+export const URL_PASSWORD_PLACEHOLDER_WORDS = new Set([
+  "PASSWORD",
+  "PASS",
+  "PASSWD",
+  "YOUR_PASSWORD",
+  "DB_PASSWORD",
+  "MY_PASSWORD",
+  "CHANGEME",
+  "CHANGE_ME",
+  "PLACEHOLDER",
+  "REDACTED",
+  "EXAMPLE",
+]);
+function urlPasswordIsPlaceholder(span: string): boolean {
+  const m = span.match(/:\/\/[^:]+:([^@]+)@/);
+  const pw = m?.[1] ?? "";
+  if (pw === "") return true;
+  if (INTERPOLATED_PASSWORD_RE.test(pw)) return true;
+  if (URL_PASSWORD_PLACEHOLDER_WORDS.has(pw)) return true;
+  return PLACEHOLDER_STRUCTURAL.some((re) => re.test(pw));
+}
+
+/**
+ * #2913: `postgres:postgres` is the official postgres image's default pair,
+ * committed in compose files and CI DATABASE_URLs. It is exempt only on a
+ * loopback host (`localhost` or `127.0.0.1`, optional port), never on a
+ * single-label host such as `db`: a compose service name says nothing about
+ * where the same URL is also deployed, and a weak default on a reachable host
+ * is exactly the leak to report. Exact user and password, case-sensitive;
+ * the host must end at a port, path, query, quote or the span's end.
+ */
+const POSTGRES_LOOPBACK_DEFAULT =
+  /^postgres(?:ql)?:\/\/postgres:postgres@(?:localhost|127\.0\.0\.1)(?::\d{1,5})?(?![\w.:@%-])/;
+
+/**
+ * A value span that is only an environment-variable read expression (#2912):
+ * `process.env.X`, an `env` member of any object chain read by an ALL-CAPS
+ * name (`opts?.env?.AGENT_API_TOKEN`, `import.meta.env.VITE_X`, GST-1894),
+ * or the opening of an indexed or call read (`process.env[`, `os.environ[`,
+ * `os.getenv(`, `System.getenv(`). `env` must be a whole segment, so
+ * `myenv.X` is a value.
+ */
+const ENV_READ_SPAN =
+  /^(?:os\.environ\[|os\.environ\.get\(|(?:[A-Za-z_$][\w$]*\.)?getenv\(|ENV\[|process\.env\.[A-Za-z_$][\w$]*[;,)]?|(?:[A-Za-z_$][\w$]*[!?]?\.)*env(?:[!?]?\.[A-Z_][A-Z0-9_]*[;,)]?|(?:\?\.)?\[))$/;
+/** The reads #2912 exempted before GST-1894; a line with a fallback keeps exactly this exemption. */
+const ENV_READ_SPAN_2912 =
+  /^(?:os\.environ\[|os\.environ\.get\(|os\.getenv\(|getenv\(|ENV\[|process\.env\.[A-Za-z_$][\w$]*[;,)]?)$/;
+/** The quoted ALL-CAPS variable name an indexed or call read opens with (`"AGENT_API_TOKEN"]`, `'DB_PASSWORD',`). */
+const ENV_NAME_ARGUMENT = /^(["'])[A-Z_][A-Z0-9_]*\1/;
+/** A fallback or default after the read: `??`, `||`, `or` or a ternary `:`, anywhere on the line. */
+const ENV_READ_FALLBACK = /\?\?|\|\||(?<![\w$])or(?![\w$])|:/;
+/**
+ * The rest of the line is read from the span's end, so a quote the match took
+ * is still seen: a literal fallback (`os.getenv("X", "<secret>")`) or a
+ * literal used as the name (`os.environ["<secret>"]`) keeps the finding.
+ * GST-1894's wider reads (`opts?.env?.X`, `process.env["X"]`,
+ * `System.getenv("X")`) are exempt only when the line holds no fallback, no
+ * second argument, and ends the expression with `;`, `,` or `)`. Any other
+ * line reads exactly as #2912 did, so a fallback after a comment, a blank line
+ * or on the next line is never exempted by the wider reads. The next line is
+ * never read.
+ */
+function isBareEnvRead(span: string, match: RegExpExecArray): boolean {
+  const opensArgument = /[[(]$/.test(span);
+  const line = match.input.slice(spanBounds(match).end).split("\n", 1)[0];
+  const rest = opensArgument ? line.replace(ENV_NAME_ARGUMENT, "") : line;
+  if (ENV_READ_FALLBACK.test(rest) || (opensArgument && /^[ \t]*,/.test(rest)))
+    return ENV_READ_SPAN_2912.test(span) && !carriesSecretLiteral(rest);
+  if (!ENV_READ_SPAN.test(span) || carriesSecretLiteral(rest)) return false;
+  const after = opensArgument ? rest.replace(/^[\])]/, "") : rest;
+  return ENV_READ_SPAN_2912.test(span) || /[;,)]$/.test(span) || /^[ \t]*[;,)]/.test(after);
+}
+
+/** True when `text` holds a quoted, non-placeholder, high-entropy literal. */
+function carriesSecretLiteral(text: string): boolean {
+  for (const [, literal] of text.matchAll(/["']([^\s'"]{8,})["']/g))
+    if (!isPlaceholderSpan(literal) && shannonEntropy(literal) >= 3.0) return true;
+  return false;
+}
+
+/**
+ * #2899: the value capture is any non-space run, so it swallows code:
+ * `session = _FlakySession(responses=[...])`, `token = make_token(user,`,
+ * `password = getpass.getpass()`. A bare credential name plus mixed-case code
+ * clears the entropy gate. The span alone cannot tell `Abc123(xyz` (a real
+ * password) from a call, so the exemption needs the line's evidence: the
+ * value is unquoted, starts with an identifier or dotted path followed by
+ * `(`, and that call closes on the line or opens a multi-line argument list.
+ * A quoted value is a literal, and a call whose arguments carry a
+ * high-entropy literal (`decrypt("<secret>")`) still reports.
+ */
+const CALL_SHAPED_VALUE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\(/;
+
+/**
+ * #3208: a catalog or schema entry `"input_key": "expected_media_rate_bits"`
+ * names a field, it holds no credential. Exempt only when both sides say so:
+ * the whole name is one lowercase data-model word plus `_key` (no further
+ * prefix, so `cosmosdb_primary_key` and `api_cache_key` still fire), and the
+ * value is two or more lowercase identifier words joined by `_`, `-` or `.`.
+ * A random key is mixed-case or one unbroken run, so it never takes this shape.
+ */
+const SCHEMA_FIELD_NAME =
+  /^(?:[ +-]?\+|[ +-]?-(?! [^ \t]))?[ \t]*["']?(?:input|output|field|column|lookup|cache|sort|partition|range|index|row|group|join|property|metric|catalog|schema|translation|idempotency|dedup)[_.-]key["']?[ \t]*[:=]/;
+const SCHEMA_FIELD_VALUE = /^[a-z][a-z0-9]*(?:[_.-][a-z][a-z0-9]*)+$/;
+function isSchemaFieldIdentifier(span: string, match: RegExpExecArray): boolean {
+  return SCHEMA_FIELD_NAME.test(match[0]) && SCHEMA_FIELD_VALUE.test(span);
+}
+/**
+ * GST-1894: in a test file, a value made only of lowercase words joined by `-`
+ * or `_`, one of them a credential word (`personal-secret`,
+ * `staging-api-key`), is a fixture label that says what it stands for.
+ * Decided by the file name (`*.test.ts`, `*.spec.tsx`, `test_*.py`,
+ * `*_test.go`). Outside a test file, without a path, or with a digit, an
+ * uppercase letter or no credential word, the value is checked as before.
+ */
+const TEST_SOURCE = /(?:^|[\\/])(?:[^\\/]+(?:\.test|\.spec|_test)\.(?:[cm]?[jt]sx?|py|go|rb|dart)|test_[^\\/]+\.py)$/;
+const FIXTURE_LABEL = /^[a-z]+(?:[-_][a-z]+)+$/;
+const FIXTURE_CREDENTIAL_WORD = /(?:^|[-_])(?:secret|token|password|passwd|key|credential)s?(?:[-_]|$)/;
+function isTestFixtureLabel(span: string, sourcePath: string | undefined): boolean {
+  return !!sourcePath && TEST_SOURCE.test(sourcePath) && FIXTURE_LABEL.test(span) && FIXTURE_CREDENTIAL_WORD.test(span);
+}
+/**
+ * GST-1064: the first argument of a lookup call (`get`, `getenv`, `read`,
+ * `load`, `loads`, `open`, `pop`, `fetch`) that is a lowercase file name
+ * (`files.get("key.json")`) or a snake_case key of two or three words
+ * (`resp.json().get("access_token")`) names what the call reads. Eight distinct
+ * letters already reach 3.0 bits, so entropy alone cannot tell it from a
+ * secret. Any other callee (`make_password("orange_monkey_pass")`), a grouping
+ * paren, a later argument or a fallback (`os.getenv("X", "orange_monkey_pass")`)
+ * is a value and is still checked, and so is a first argument with a digit, an
+ * uppercase letter, kebab words or four or more snake_case words.
+ */
+const LOOKUP_ARGUMENT =
+  /(?<![\w$])(get|getenv|read|load|loads|open|pop|fetch)\([ \t]*(["'])(?:[a-z]+(?:_[a-z]+){1,2}|[a-z]+(?:[_-][a-z]+)*\.(?:json|ya?ml|toml|ini|cfg|conf|env|pem|crt|cer|key|txt|csv|xml|cookie))\2/g;
+function isCallExpression(span: string, match: RegExpExecArray): boolean {
+  if (!CALL_SHAPED_VALUE.test(span)) return false;
+  const { start } = spanBounds(match);
+  if (match.input[start - 1] === '"' || match.input[start - 1] === "'") return false;
+  const call = match.input.slice(start + span.indexOf("(")).split("\n", 1)[0];
+  if (!call.includes(")") && call.trim() !== "(") return false;
+  const line = match.input.slice(start).split("\n", 1)[0];
+  return !carriesSecretLiteral(line.replace(LOOKUP_ARGUMENT, "$1("));
+}
+
+/**
+ * #3048: in a TypeScript/JSX file, an unquoted value after `:` is a type or an
+ * expression, never a string literal (`session: SessionState,`), and a JSX
+ * brace holding only names and property reads joined by + ?? || or &&
+ * (`key={turn.requestId + turn.role}`, `key={item.id ?? index}`, #3605) is an
+ * expression. Decided by file context, not by how the value looks:
+ * `API_KEY=VelvetRiverOrbitSunset;` in a .env or YAML file is still a literal.
+ * #3630 (#3418, #3419): Dart and Python (.py, .pyi) qualify on the same grammar
+ * fact, no unquoted string literal, so `'password': request.password` and
+ * `session: HttpSession,` are names. Python's keyword form
+ * (`password=request.password,`) still fires: the separator must be `:`. A
+ * plain `=` assignment of a dotted name is isAttributeReference's (#4209).
+ * Without a known source path nothing is exempt.
+ */
+const CODE_SOURCE = /\.(?:[cm]?tsx?|jsx|dart|pyi?)$/i;
+const CODE_NAME_CHAIN = /^[A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*(?:<[\w$.,\s<>[\]|]*>)?(?:\[\])*$/;
+
+/**
+ * #3418: a `password:` pair inside a string is text in an embedded config,
+ * not a dict entry or annotation, so the name exemption must not reach it.
+ * In Python and Dart (no regex literals, so every quote is a string's), one
+ * linear pass per input (a scan validates many candidates against the same
+ * text) records every string's content span: a `'''`/`"""` block, or a
+ * `'`/`"` string that ends at its line unless a backslash continues it.
+ * Comments are skipped (`#` in Python; `//` and nested `/* *\/` in Dart), so a
+ * delimiter inside one opens nothing, and a Dart block comment's own span is
+ * recorded too: a `password:` line in it is text, not code (GST-738); a backslash escapes the next character, except in a Dart raw
+ * string (`r'''…'''`). The exemption needs the
+ * whole file to see a block's opener: pregate passes Dart and Python files
+ * whole, and the pre-push hook, which scans added lines alone, passes them
+ * without their path.
+ */
+const STRING_SPAN_SOURCE = /\.(?:dart|pyi?)$/i;
+let stringSpansCache: { text: string; lang: string; spans: Array<[number, number]> } | null = null;
+
+/** Drops the cached text once a scan ends, so a long-lived process holds no scanned input. */
+export function clearStringSpanCache(): void {
+  stringSpansCache = null;
+  codeLineCache = null;
+}
+
+/** The index after the comment at `i`: a line comment ends at its newline, a Dart block comment at its matching `*\/` (they nest). */
+function commentEnd(text: string, i: number, lang: "py" | "dart"): number {
+  if (lang === "py" || !text.startsWith("/*", i)) {
+    const eol = text.indexOf("\n", i);
+    return eol < 0 ? text.length : eol;
+  }
+  let depth = 1;
+  let j = i + 2;
+  while (j < text.length && depth > 0) {
+    if (text.startsWith("/*", j)) { depth += 1; j += 2; }
+    else if (text.startsWith("*/", j)) { depth -= 1; j += 2; }
+    else j += 1;
+  }
+  return j;
+}
+
+const MAX_INTERPOLATION_DEPTH = 256;
+
+type Spans = Array<[number, number]>;
+
+/**
+ * The index after a Dart `${…}` expression starting at `j`. Its code is not
+ * text; its strings and block comments add their own spans.
+ */
+function dartExpressionEnd(text: string, j: number, depth: number, spans: Spans): number {
+  if (depth > MAX_INTERPOLATION_DEPTH) return text.length;
+  for (let open = 1; j < text.length && open > 0; ) {
+    const d = text[j]!;
+    if (text.startsWith("//", j)) { j = commentEnd(text, j, "dart"); continue; }
+    if (text.startsWith("/*", j)) { const end = commentEnd(text, j, "dart"); spans.push([j, end]); j = end; continue; }
+    if (d === '"' || d === "'") { j = stringAt(text, j, "dart", depth, spans); continue; }
+    if (d === "{") open += 1;
+    else if (d === "}") open -= 1;
+    j += 1;
+  }
+  return Math.min(j, text.length);
+}
+
+/**
+ * The index after a Python replacement field whose expression starts at `j`.
+ * The expression is code: its `#` comments are skipped and its strings add
+ * their own spans. A `:` or `!` outside its brackets starts the conversion and
+ * format spec, which is text apart from nested `{…}` fields (`{n:#x}`, `{n:'>10}`).
+ */
+function pythonFieldEnd(text: string, j: number, depth: number, spans: Spans): number {
+  const n = text.length;
+  if (depth > MAX_INTERPOLATION_DEPTH) return n;
+  let nest = 0;
+  while (j < n) {
+    const d = text[j]!;
+    if (d === "#") { j = commentEnd(text, j, "py"); continue; }
+    if (d === '"' || d === "'") { j = stringAt(text, j, "py", depth, spans); continue; }
+    if (d === "}" && nest === 0) return j + 1;
+    if (nest === 0 && (d === ":" || (d === "!" && text[j + 1] !== "="))) {
+      let from = j + 1;
+      for (j += 1; j < n && text[j] !== "}"; ) {
+        if (text[j] !== "{") { j += 1; continue; }
+        if (from < j) spans.push([from, j]);
+        j = pythonFieldEnd(text, j + 1, depth + 1, spans);
+        from = j;
+      }
+      if (from < Math.min(j, n)) spans.push([from, Math.min(j, n)]);
+      return Math.min(j + 1, n);
+    }
+    if ("([{".includes(d)) nest += 1;
+    else if (")]}".includes(d)) nest = Math.max(0, nest - 1);
+    j += 1;
+  }
+  return n;
+}
+
+/**
+ * Adds the text spans of the string whose quote is at `i` and returns the index
+ * after its closing delimiter. An interpolated expression (`{…}` in a Python
+ * f- or t-string, `${…}` in a non-raw Dart string) is code: it is skipped
+ * whole, with its nested strings as their own spans, so a quote inside it never
+ * ends the outer string (GST-738). An expression left open, or nested past
+ * MAX_INTERPOLATION_DEPTH, is text to the end of the file. In a Python f-string
+ * `\{` still opens a field.
+ */
+function stringAt(text: string, i: number, lang: "py" | "dart", depth: number, spans: Spans): number {
+  const n = text.length;
+  const c = text[i]!;
+  const close = text.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+  const multiline = close.length === 3;
+  let k = i;
+  while (k > 0 && /[A-Za-z]/.test(text[k - 1]!)) k -= 1;
+  const prefix = k === 0 || !/[\w$]/.test(text[k - 1]!) ? text.slice(k, i) : "";
+  const raw = lang === "dart" && prefix === "r";
+  const interpolated = lang === "dart" ? !raw : /^(?:[rR]?[fFtT]|[fFtT][rR])$/.test(prefix);
+  let j = i + close.length;
+  let from = j;
+  while (j < n && !text.startsWith(close, j) && (multiline || text[j] !== "\n")) {
+    if (!raw && text[j] === "\\") { j += lang === "py" && interpolated && text[j + 1] === "{" ? 1 : 2; continue; }
+    if (!interpolated) { j += 1; continue; }
+    if (lang === "py" && text.startsWith("{{", j)) { j += 2; continue; }
+    if (lang === "py" ? text[j] !== "{" : !text.startsWith("${", j)) { j += 1; continue; }
+    if (from < j) spans.push([from, j]);
+    const field = j;
+    const mark = spans.length;
+    j = lang === "py" ? pythonFieldEnd(text, j + 1, depth + 1, spans) : dartExpressionEnd(text, j + 2, depth + 1, spans);
+    if (j >= n) { spans.length = mark; from = field; break; }
+    from = j;
+  }
+  const end = Math.min(j, n);
+  if (from < end) spans.push([from, end]);
+  return end + close.length;
+}
+
+function stringSpans(text: string, lang: "py" | "dart"): Spans {
+  if (stringSpansCache?.text === text && stringSpansCache.lang === lang) return stringSpansCache.spans;
+  const spans: Spans = [];
+  const n = text.length;
+  for (let i = 0; i < n; ) {
+    const c = text[i]!;
+    if (lang === "py" ? c === "#" : text.startsWith("//", i)) {
+      i = commentEnd(text, i, lang);
+      continue;
+    }
+    if (lang === "dart" && text.startsWith("/*", i)) {
+      const end = commentEnd(text, i, lang);
+      spans.push([i, end]);
+      i = end;
+      continue;
+    }
+    if (c !== '"' && c !== "'") { i += 1; continue; }
+    i = stringAt(text, i, lang, 0, spans);
+  }
+  stringSpansCache = { text, lang, spans };
+  return spans;
+}
+
+/**
+ * JS template literals and block comments, from one pass over the whole input:
+ * the context a line cannot show on its own. A quote ends at its line end, a
+ * line comment is skipped, and `${…}` stays template text. A regex literal is
+ * not recognized, so a `//` or quote inside one can hide a template that opens
+ * later on its line, and a host in that template is exempt as it was before
+ * jsSpans. Cached and cleared with stringSpans.
+ */
+function jsSpans(text: string): Spans {
+  if (stringSpansCache?.text === text && stringSpansCache.lang === "js") return stringSpansCache.spans;
+  const spans: Spans = [];
+  const n = text.length;
+  for (let i = 0; i < n; ) {
+    const c = text[i]!;
+    if (text.startsWith("//", i)) {
+      const newline = text.indexOf("\n", i);
+      i = newline < 0 ? n : newline;
+    } else if (text.startsWith("/*", i)) {
+      const close = text.indexOf("*/", i + 2);
+      const end = close < 0 ? n : close + 2;
+      spans.push([i, end]);
+      i = end;
+    } else if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      while (j < n && text[j] !== c && (c === "`" || text[j] !== "\n")) j += text[j] === "\\" ? 2 : 1;
+      if (c === "`") spans.push([i, Math.min(j + 1, n)]);
+      i = j + 1;
+    } else i += 1;
+  }
+  stringSpansCache = { text, lang: "js", spans };
+  return spans;
+}
+
+function inSpans(spans: Spans, offset: number): boolean {
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (offset < spans[mid]![0]) hi = mid - 1;
+    else if (offset >= spans[mid]![1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+function insideString(text: string, offset: number, sourcePath: string): boolean {
+  if (!STRING_SPAN_SOURCE.test(sourcePath)) return false;
+  return inSpans(stringSpans(text, /\.dart$/i.test(sourcePath) ? "dart" : "py"), offset);
+}
+
+/** The rest of a name's expression on its line, up to the comma, semicolon, bracket or comment that ends it; null when it continues on the next line. */
+function expressionTail(line: string, comment: string): string | null {
+  let rest = line;
+  let depth = 0;
+  for (let i = 0; i < rest.length; i += 1) {
+    const c = rest[i]!;
+    if (rest.startsWith(comment, i)) { rest = rest.slice(0, i); break; }
+    if (c === '"' || c === "'" || c === "`") {
+      const close = rest.indexOf(c, i + 1);
+      if (close < 0) return null;
+      i = close;
+    } else if ("([{".includes(c)) depth += 1;
+    else if (")]}".includes(c)) { if (--depth < 0) return rest.slice(0, i); }
+    else if ((c === "," || c === ";") && depth === 0) return rest.slice(0, i);
+  }
+  return depth > 0 || /(?:[=+\\]|\?\?|\|\||&&|\b(?:or|and))\s*$/.test(rest) ? null : rest;
+}
+
+function isSourceExpression(span: string, match: RegExpExecArray, sourcePath: string | undefined): boolean {
+  if (!sourcePath || !CODE_SOURCE.test(sourcePath)) return false;
+  const { start, end } = spanBounds(match);
+  const before = match.input[start - 1];
+  if (before === '"' || before === "'" || before === "`") return false;
+  if (span.startsWith("{")) {
+    const line = match.input.slice(start + 1).split("\n", 1)[0];
+    const close = line.indexOf("}");
+    if (close < 0 || /["'`]/.test(line.slice(0, close))) return false;
+    if (!line.slice(0, close).split(/\+|\?\?|\|\||&&/).every(term => CODE_NAME_CHAIN.test(term.trim()))) return false;
+  } else {
+    const head = match[0].slice(0, match[0].length - span.length).trimEnd();
+    const separator = head.slice(-1);
+    if (separator !== ":" || !CODE_NAME_CHAIN.test(span.replace(/[,;)=|]+$/, ""))) return false;
+    const rest = (span.endsWith("=") ? "=" : "") + match.input.slice(end).split("\n", 1)[0];
+    if (!/[,;]$/.test(span)) {
+      const tail = expressionTail(rest, /\.pyi?$/i.test(sourcePath) ? "#" : "//");
+      if (tail === null || carriesSecretLiteral(tail)) return false;
+    }
+  }
+  return !insideString(match.input, start, sourcePath);
+}
+
+/**
+ * #4209: in Python and Dart source, an unquoted dotted name chain that is the
+ * whole right-hand side of an `=` assignment (`session = self.client.session`,
+ * `token = request.auth`) reads an attribute; it holds no credential. Only
+ * Python and Dart, where the whole file's strings are known (insideString), so
+ * the same line inside a `"""`/`'''` block still reports. Every segment must be
+ * name-shaped (snake_case, camelCase, PascalCase or CONSTANT_CASE), so a dotted
+ * random token still reports, and only a `;` and a comment may follow it on
+ * the line: a literal after it (`or "…"`, `, "…"`), a continuation or a
+ * keyword argument's comma still reports. A quoted value, a bare name, a
+ * config, .env or TS file, and a scan without a path are unchanged.
+ */
+const ATTRIBUTE_SEGMENT = /^_*(?:[a-z][a-z0-9]*(?:_+[a-z0-9]+)*|[A-Z][A-Z0-9]*(?:_+[A-Z0-9]+)*|[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]+)*)_*$/;
+function isAttributeReference(span: string, match: RegExpExecArray, sourcePath: string | undefined): boolean {
+  if (!sourcePath || !STRING_SPAN_SOURCE.test(sourcePath)) return false;
+  const chain = span.replace(/;$/, "").split(".");
+  if (chain.length < 2 || !chain.every((segment) => ATTRIBUTE_SEGMENT.test(segment))) return false;
+  const { start, end } = spanBounds(match);
+  if (!/=[ \t]*$/.test(match.input.slice(match.index, start))) return false;
+  const rest = match.input.slice(end).split("\n", 1)[0];
+  if (!(/\.dart$/i.test(sourcePath) ? /^[ \t]*(?:\/\/.*)?\r?$/ : /^[ \t]*(?:#.*)?\r?$/).test(rest)) return false;
+  return !insideString(match.input, start, sourcePath);
+}
+
+/** The files isPropertyRead exempts in: TS, Dart and Python. JSX text in .tsx and .jsx can hold a host on any line, so those report as before. */
+const PROPERTY_READ_SOURCE = /\.(?:[cm]?ts|dart|pyi?)$/i;
+/** How far back on its line isPropertyRead reads from a span. A span further from its line start than this is never exempted. */
+const PROPERTY_READ_LINE_CHARS = 1000;
+/** The object chain in front of a span (`this.`, `ctx.`, `a!.`), skipped before the lead is read. Matched against the last 80 characters only, so a longer chain leaves a name as the lead, which never qualifies. */
+const PROPERTY_READ_CHAIN = /(?:[\w$#]+[!?]?\.)+$/;
+/** The token that opens an expression in front of the chain: an operator or bracket, or one of the language's expression keywords. Matched against the last 7 characters of the lead. */
+const PROPERTY_READ_LEAD = /(?:[([{,;?:=+]|=>|&&|\|\||\.\.\.)$/;
+const PROPERTY_READ_KEYWORD = {
+  js: /(?<![\w$])(?:return|await|typeof|yield|case|of|in)$/,
+  dart: /(?<![\w$])(?:return|await|yield|case|in)$/,
+  py: /(?<![\w$])(?:return|await|yield|not|and|or|in|if|elif|while|assert|else)$/,
+};
+/** After a span at the very start of its line, only a call, index or assignment shows code: a line holding just a host, or a host and a comma, is a list in a multi-line string. */
+const PROPERTY_READ_LINE_START_TAIL = /^(?:[ \t]*[([=]|\.[A-Za-z_$][\w$]*[ \t]*\()/;
+/** A line that is only a key and `:` or `=` before the span, the shape of YAML or dotenv text inside a JS template literal. */
+const PROPERTY_READ_BARE_KEY = /^[ \t]*[\w$.-]+[ \t]*[:=]$/;
+/** What closes or continues an expression after the span: a bracket, separator, operator, method call, cast, Python keyword, comment or line end. A `:` before a digit or `/` is a port or URL. */
+const PROPERTY_READ_TAIL = /^(?:[ \t]*(?:[()[\],;?=!]|&&|\|\||:(?![\d/])|\/\/|#|\r?$)|\.[A-Za-z_$][\w$]*[ \t]*\(|[ \t]+(?:as|and|or|if|else|for|instanceof)\b)/;
+
+/**
+ * codeLineStart's place in the text it last read: the next index, the start of
+ * that line, and what is open there. A scan checks its spans in order, so the
+ * next span resumes from here and the text is read once.
+ */
+let codeLineCache: {
+  text: string;
+  at: number;
+  lineStart: number;
+  indent: boolean;
+  quote: string;
+  comment: "" | "line" | "block";
+  slash: boolean;
+} | null = null;
+
+/**
+ * The start of `offset`'s line when `offset` is code, else -1: inside a quote
+ * opened on the line, after a line comment, inside a block comment opened on
+ * the line, on a block comment's `*` continuation line, or more than
+ * PROPERTY_READ_LINE_CHARS from the line start, or, in JS, after a `/` in
+ * code on the line (a regex literal can hold a quote, which would turn the
+ * quote tracking around). Each line is read on its own
+ * (a quote or comment never carries over a newline), so a span's answer
+ * depends only on its own line, whichever spans were checked before it.
+ */
+function codeLineStart(text: string, offset: number, lang: "js" | "py" | "dart"): number {
+  const cap = PROPERTY_READ_LINE_CHARS;
+  let s = codeLineCache;
+  if (!s || s.text !== text || s.at > offset || offset - s.at > cap) {
+    const head = text.slice(Math.max(0, offset - cap - 1), offset);
+    const newline = head.lastIndexOf("\n");
+    if (newline < 0 && offset > cap) return -1;
+    const lineStart = offset - head.length + newline + 1;
+    s = codeLineCache = { text, at: lineStart, lineStart, indent: true, quote: "", comment: "", slash: false };
+  }
+  let i = s.at;
+  while (i < offset) {
+    const c = text[i]!;
+    if (c === "\n") {
+      Object.assign(s, { lineStart: i + 1, indent: true, quote: "", comment: "", slash: false });
+      i += 1;
+      continue;
+    }
+    if (s.indent) {
+      if (c === " " || c === "\t") { i += 1; continue; }
+      s.indent = false;
+      if (c === "*" && lang !== "py") s.comment = "line";
+    }
+    if (s.comment === "line") {
+      i += 1;
+    } else if (s.comment === "block") {
+      if (text.startsWith("*/", i)) { s.comment = ""; i += 2; } else i += 1;
+    } else if (s.quote) {
+      if (c === "\\" && text[i + 1] !== "\n") i += 2;
+      else if (text.startsWith(s.quote, i)) { i += s.quote.length; s.quote = ""; }
+      else i += 1;
+    } else if (lang === "py" ? c === "#" : text.startsWith("//", i)) {
+      s.comment = "line";
+    } else if (lang !== "py" && text.startsWith("/*", i)) {
+      s.comment = "block";
+      i += 2;
+    } else if (c === '"' || c === "'" || (c === "`" && lang === "js")) {
+      s.quote = lang !== "js" && text.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+      i += s.quote.length;
+    } else {
+      if (c === "/" && lang === "js") s.slash = true;
+      i += 1;
+    }
+  }
+  s.at = Math.max(i, offset);
+  return s.quote || s.comment || s.slash || offset - s.lineStart > cap ? -1 : s.lineStart;
+}
+
+/**
+ * True when an `internal.hostname` span is a property read in source code
+ * (`server.local('/x')`, `if (config.prod)`, `if settings.internal:`) rather
+ * than a host (#3987). The pattern ends in `.local|.prod|.staging|…`, so any
+ * object with a property of that name reported, and the pregate secrets stage
+ * warned on every one in a pushed diff.
+ *
+ * Exempts only when all of these hold: the scan has a TS, Dart or Python
+ * file's path (PROPERTY_READ_SOURCE; without one nothing is exempt, and .tsx
+ * and .jsx report as before), the span starts with an
+ * identifier, it sits outside every string and comment on its line (and, in
+ * Python and Dart, outside every string of the file: insideString), and the
+ * line shows code syntax on both sides of it: an operator, bracket or one of
+ * the language's expression keywords before its object chain (or the line
+ * start, when a call, index or assignment follows), and a bracket, operator,
+ * method call or line end after it. A quoted host, a host in a comment,
+ * `db.internal:5432`, `build-7.internal`, `proxy.corp/api`, prose, and every
+ * host in a config, dotenv or Markdown file still report. In TS, a span
+ * inside a template literal or block comment of the scanned text (jsSpans) is
+ * never exempt. A scan of added lines only cannot see a
+ * template literal that opened above them, so in JS a line that is only a key
+ * and `:` or `=` before the span (`host: db.internal`, `DB_HOST=db.internal`)
+ * is never exempt either.
+ */
+function isPropertyRead(match: RegExpExecArray, sourcePath: string | undefined): boolean {
+  if (!sourcePath || !PROPERTY_READ_SOURCE.test(sourcePath)) return false;
+  const input = match.input ?? "";
+  const { start, end } = spanBounds(match);
+  if (!/^[A-Za-z_$][\w$]*\./.test(input.slice(start, end))) return false;
+  const after = input.slice(end, end + 40).split("\n", 1)[0]!;
+  if (!PROPERTY_READ_TAIL.test(after)) return false;
+  const lang = /\.pyi?$/i.test(sourcePath) ? "py" : /\.dart$/i.test(sourcePath) ? "dart" : "js";
+  const lineStart = codeLineStart(input, start, lang);
+  if (lineStart < 0) return false;
+  const before = input.slice(lineStart, start);
+  let k = before.length - (PROPERTY_READ_CHAIN.exec(before.slice(-80))?.[0].length ?? 0);
+  while (k > 0 && before[k - 1] === "!") k -= 1;
+  while (k > 0 && (before[k - 1] === " " || before[k - 1] === "\t")) k -= 1;
+  const lead = before.slice(Math.max(0, k - 7), k);
+  if (lang === "js" && PROPERTY_READ_BARE_KEY.test(before.slice(0, k))) return false;
+  if (k === 0 ? !PROPERTY_READ_LINE_START_TAIL.test(after) : !PROPERTY_READ_LEAD.test(lead) && !PROPERTY_READ_KEYWORD[lang].test(lead)) return false;
+  return lang === "js" ? !inSpans(jsSpans(input), start) : !insideString(input, start, sourcePath);
+}
+
+export const PATTERNS: RedactPattern[] = [
+  // ===== HIGH — genuinely-secret credentials (block) =====
+  {
+    id: "aws.access_key",
+    tier: "HIGH",
+    category: "secret",
+    description: "AWS access key ID (AKIA… long-term, ASIA… temporary)",
+    regex: /\b((?:AKIA|ASIA)[0-9A-Z]{16})\b/,
+  },
+  {
+    id: "aws.secret_key",
+    tier: "HIGH",
+    category: "secret",
+    description: "AWS secret access key (with aws_secret_access_key nearby)",
+    regex: /\b([A-Za-z0-9/+=]{40})\b/,
+    nearRegex: /aws.{0,3}secret.{0,3}access.{0,3}key/i,
+    nearWindow: 100,
+  },
+  {
+    id: "github.pat",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub personal access token (classic)",
+    regex: /\b(ghp_[A-Za-z0-9]{36})\b/,
+  },
+  {
+    id: "github.oauth",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub OAuth token",
+    regex: /\b(gho_[A-Za-z0-9]{36})\b/,
+  },
+  {
+    id: "github.server",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub server-to-server token",
+    regex: /\b(ghs_[A-Za-z0-9]{36})\b/,
+  },
+  {
+    id: "github.user_to_server",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub App user-to-server token",
+    regex: /\b(ghu_[A-Za-z0-9]{36})\b/,
+  },
+  {
+    id: "github.refresh",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub App refresh token",
+    regex: /\b(ghr_[A-Za-z0-9]{36,})\b/,
+  },
+  {
+    id: "github.fine_grained",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitHub fine-grained PAT",
+    regex: /\b(github_pat_[A-Za-z0-9_]{82})\b/,
+  },
+  {
+    id: "gitlab.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "GitLab token (personal/pipeline-trigger/deploy)",
+    // glpat- personal access, glptt- pipeline trigger, gldt- deploy token.
+    // gstack drives glab first-class — these were a coverage gap (#1946).
+    regex: /\b(gl(?:pat|ptt|dt)-[A-Za-z0-9_-]{20,})\b/,
+  },
+  {
+    id: "groq.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "Groq API key",
+    regex: /\b(gsk_[A-Za-z0-9]{20,})\b/,
+  },
+  {
+    id: "tavily.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "Tavily API key (incl. tvly-dev-/tvly-prod-)",
+    // Explicit environment infixes rather than a globally-optional segment,
+    // which would also match separator-less tvly-devabc… (same reasoning as
+    // openai.key above).
+    regex: /\b(tvly-(?:dev-|prod-)?[A-Za-z0-9]{16,})\b/,
+  },
+  {
+    id: "notion.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "Notion integration token (ntn_ current, secret_ legacy)",
+    // Two explicit shapes. The legacy `secret_` form keeps a high {40,} floor
+    // because the prefix is an ordinary English word — the length is what makes
+    // it a credential rather than prose.
+    regex: /\b(ntn_[A-Za-z0-9]{40,}|secret_[A-Za-z0-9]{40,})\b/,
+  },
+  {
+    id: "huggingface.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "HuggingFace access token",
+    regex: /\b(hf_[A-Za-z0-9]{30,})\b/,
+  },
+  {
+    id: "npm.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "npm granular access token",
+    regex: /\b(npm_[A-Za-z0-9]{36})\b/,
+  },
+  {
+    id: "digitalocean.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "DigitalOcean personal access token",
+    regex: /\b(dop_v1_[a-f0-9]{64})\b/,
+  },
+  {
+    id: "gcp.service_account",
+    tier: "HIGH",
+    category: "secret",
+    description: "GCP service-account JSON private key",
+    // The JSON-escaped form ("private_key": "-----BEGIN PRIVATE KEY-----\n...)
+    // dodges pem.private_key's literal-block match when minified to one line.
+    // Proximity to "private_key_id" confirms the GCP service-account shape.
+    regex: /("private_key"\s*:\s*"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----)/,
+    nearRegex: /"private_key_id"/,
+    nearWindow: 300,
+  },
+  {
+    id: "anthropic.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "Anthropic API key",
+    regex: /\b(sk-ant-[A-Za-z0-9_\-]{20,})\b/,
+  },
+  {
+    id: "openai.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "OpenAI API key (incl. sk-proj-/sk-svcacct-/sk-admin-)",
+    // Two explicit shapes (NOT a globally-optional prefix, which would match
+    // malformed sk--... or separator-less sk-projabc...):
+    //   prefixed: sk-{proj,svcacct,admin}- + base64url-ish body (allows -_)
+    //   bare:     sk- + contiguous alphanumeric run (legacy), keeps {32,} floor
+    regex:
+      /\b(sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,})\b/,
+  },
+  {
+    id: "openrouter.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "OpenRouter API key",
+    regex: /\b(sk-or-v1-[a-f0-9]{64})\b/,
+  },
+  {
+    id: "sendgrid.key",
+    tier: "HIGH",
+    category: "secret",
+    description: "SendGrid API key",
+    regex: /\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b/,
+  },
+  {
+    id: "stripe.secret",
+    tier: "HIGH",
+    category: "secret",
+    description: "Stripe live SECRET key",
+    regex: /\b(sk_live_[A-Za-z0-9]{24,})\b/,
+  },
+  {
+    id: "stripe.restricted",
+    tier: "HIGH",
+    category: "secret",
+    description: "Stripe live restricted key",
+    regex: /\b(rk_live_[A-Za-z0-9]{24,})\b/,
+  },
+  {
+    id: "supabase.secret",
+    tier: "HIGH",
+    category: "secret",
+    description: "Supabase secret API key",
+    regex: /\b(sb_secret_[A-Za-z0-9_-]{20,})\b/,
+  },
+  {
+    id: "supabase.pat",
+    tier: "HIGH",
+    category: "secret",
+    description: "Supabase personal access token",
+    regex: /\b(sbp_[a-f0-9]{40})\b/,
+  },
+  {
+    id: "slack.token",
+    tier: "HIGH",
+    category: "secret",
+    description: "Slack token (bot/user/app)",
+    regex: /\b(xox[baprs]-[A-Za-z0-9-]{10,})\b/,
+  },
+  {
+    id: "slack.webhook",
+    tier: "HIGH",
+    category: "secret",
+    description: "Slack incoming webhook URL",
+    regex: /(https:\/\/hooks\.slack\.com\/services\/T[A-Z0-9]+\/B[A-Z0-9]+\/[A-Za-z0-9]{24})/,
+  },
+  {
+    id: "discord.webhook",
+    tier: "HIGH",
+    category: "secret",
+    description: "Discord webhook URL",
+    regex: /(https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api\/webhooks\/[0-9]{17,20}\/[A-Za-z0-9_\-]{60,})/,
+  },
+  {
+    id: "twilio.auth_token",
+    tier: "HIGH",
+    category: "secret",
+    description: "Twilio auth token (32 hex, with an Account SID nearby)",
+    regex: /\b([a-f0-9]{32})\b/,
+    nearRegex: /\bAC[a-f0-9]{32}\b/,
+    nearWindow: 200,
+  },
+  {
+    id: "google.oauth_client_secret",
+    tier: "HIGH",
+    category: "secret",
+    // Distinct from google.api_key (MEDIUM): an AIza key is often a public
+    // client key, but a GOCSPX- client secret is never publishable — leaking
+    // it lets anyone impersonate the OAuth app's token exchange.
+    description: "Google OAuth client secret (GOCSPX-…)",
+    regex: /\b(GOCSPX-[A-Za-z0-9_-]{20,40})(?![A-Za-z0-9_-])/,
+    validate: (span) => !isPlaceholderSpan(span),
+  },
+  {
+    id: "telegram.bot_token",
+    tier: "HIGH",
+    category: "secret",
+    description: "Telegram bot token (<bot-id>:AA…)",
+    regex: /\b([0-9]{6,16}:A[A-Za-z0-9_-]{34})(?![A-Za-z0-9_-])/,
+    validate: (span) => !isPlaceholderSpan(span),
+  },
+  {
+    id: "pem.private_key",
+    tier: "HIGH",
+    category: "secret",
+    description: "PEM private key block",
+    regex: /(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----)/,
+  },
+  {
+    id: "db.url_with_password",
+    tier: "HIGH",
+    category: "secret",
+    description: "Database URL with embedded password",
+    regex: /\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^:\s/@]+:[^@\s/]+@[^\s/]+)/,
+    // Skip when the password segment is itself a placeholder/interpolation,
+    // or the URL is postgres's default pair on a loopback host.
+    validate: (span) => !urlPasswordIsPlaceholder(span) && !POSTGRES_LOOPBACK_DEFAULT.test(span),
+  },
+  {
+    id: "creds.basic_auth_url",
+    tier: "HIGH",
+    category: "secret",
+    description: "HTTP(S) URL with embedded basic-auth credentials",
+    regex: /(https?:\/\/[^:\s/@]+:[^@\s/]+@[^\s/]+)/,
+    // Skip when the password segment is itself a placeholder/interpolation.
+    validate: (span) => !urlPasswordIsPlaceholder(span),
+  },
+
+  // ===== MEDIUM — demoted credential-shaped (high-FP / context-variable) =====
+  {
+    id: "stripe.publishable",
+    tier: "MEDIUM",
+    category: "secret",
+    description: "Stripe live publishable key (often intentionally public)",
+    regex: /\b(pk_live_[A-Za-z0-9]{24,})\b/,
+  },
+  {
+    id: "google.api_key",
+    tier: "MEDIUM",
+    category: "secret",
+    description: "Google API key (AIza…; sometimes a public client key)",
+    regex: /\b(AIza[0-9A-Za-z\-_]{35})\b/,
+  },
+  {
+    id: "jwt",
+    tier: "MEDIUM",
+    category: "secret",
+    description: "JSON Web Token (3-segment base64url)",
+    regex: /\b(eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})\b/,
+  },
+  {
+    id: "env.kv",
+    tier: "MEDIUM",
+    category: "secret",
+    description: "Secret-named assignment (env/YAML/JSON) with high-entropy value",
+    // #1946 gap 3: the original shape required an UPPERCASE name and an `=`
+    // assignment, so `api_key=…`, `apiKey: "…"`, and `password: …` (YAML/JSON
+    // colon form) produced NO finding at all — a detection fail-open on the
+    // most common config shapes. Now case-insensitive with `:` or `=`
+    // assignment and optional quotes around the key (JSON). Still MEDIUM and
+    // entropy-gated: this is the calibrated generic net, not a blocker.
+    // The name part is `[A-Za-z0-9_.-]*` + suffix (zero-or-more prefix, not
+    // one-or-more): a mandatory first char would swallow the suffix's own
+    // first letter and bare names like `password:` / `key:` would never match.
+    // The wide net is then calibrated by isCredentialShapedEnvName in
+    // validate — without it, any identifier that merely ENDS in a suffix
+    // (cacheKey:, sortKey:, monkey:) fires a MEDIUM confirm on entropic
+    // values. The value must stay capture group 1 (the engine masks group 1),
+    // so name-shape checking lives in validate, not in a second group.
+    // GST-543: an optional leading `+` or `-` is a unified-diff line marker
+    // (`git diff | gstack-redact`, a diff fence in a PR body), and one more
+    // column before it (`++`, ` +`, `+-`) is a combined (merge) diff. Without
+    // them the line anchor stopped at the marker, so an added or removed credential
+    // went unreported (`-` alone matched only as a name character, never
+    // before indentation or `export`). A `-` followed by exactly one space
+    // and text is a Markdown bullet or YAML list item, not a marker, so those
+    // read as they did before. ENV_KV_NAME and SCHEMA_FIELD_NAME take the same
+    // marker so the name-shape and schema exemptions hold on a diff line.
+    regex: /^(?:[ +-]?\+|[ +-]?-(?! [^ \t]))?[ \t]*(?:export[ \t]+)?["']?[A-Za-z0-9_.-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|DSN|AUTH|COOKIE|SESSION|PRIVATE)["']?[ \t]*[:=][ \t]*["']?([^\s'"]{8,})["']?/i,
+    // Only fire on credential-shaped names with high-entropy values — kills
+    // `FOO_KEY=changeme` and `cacheKey: <entropic-id>` FPs. #2912: a value
+    // that is exactly an environment read (`os.environ["X"]`,
+    // `os.getenv("X")`, `process.env.X`, `ENV["X"]`) names a secret without
+    // holding one, unless the rest of its line carries a high-entropy quoted
+    // literal (`os.getenv("X", "<secret>")`). A literal appended to the read
+    // itself (`process.env.X||"…"`) is not an exact read and still fires.
+    // #2899: a function call assigned to the name is code, not a value (see
+    // isCallExpression). #3048, #3630: so is a TS/JSX/Dart/Python type or expression (isSourceExpression).
+    // #4209: so is a dotted attribute read assigned with = in Python or Dart (isAttributeReference).
+    // #3208: so is a schema field identifier (isSchemaFieldIdentifier).
+    // GST-1894: so is a self-named fixture label in a test file (isTestFixtureLabel).
+    validate: (span, match, opts) =>
+      isCredentialShapedEnvName(match[0]) &&
+      !isPlaceholderSpan(span) &&
+      !/^\$\{?[A-Za-z_]/.test(span) &&
+      !isBareEnvRead(span, match) &&
+      !isCallExpression(span, match) &&
+      !isSourceExpression(span, match, opts?.sourcePath) &&
+      !isAttributeReference(span, match, opts?.sourcePath) &&
+      !isSchemaFieldIdentifier(span, match) &&
+      !isTestFixtureLabel(span, opts?.sourcePath) &&
+      shannonEntropy(span) >= 3.0,
+  },
+  {
+    id: "auth.bearer",
+    tier: "MEDIUM",
+    category: "secret",
+    description: "Authorization Bearer token (high-entropy, header context)",
+    // FP-prone shape (docs and examples are full of "Bearer <token>"), so:
+    // MEDIUM tier, requires "authorization" nearby, and the same entropy
+    // recipe as env.kv to kill Bearer YOUR_TOKEN_HERE placeholders.
+    regex: /\bBearer[ \t]+([A-Za-z0-9._~+/=-]{20,})\b/,
+    nearRegex: /authorization/i,
+    nearWindow: 80,
+    validate: (span) =>
+      !isPlaceholderSpan(span) &&
+      !/^\$\{?[A-Za-z_]/.test(span) &&
+      shannonEntropy(span) >= 3.0,
+  },
+
+  // ===== MEDIUM — PII (auto-redactable subset) =====
+  {
+    id: "pii.email",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "Email address",
+    regex: /\b([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b/,
+    autoRedactable: true,
+    redactToken: "<REDACTED-EMAIL>",
+    validate: (span) => !looksLikeAtFilename(span),
+    // Engine layers the email allowlist (example.com, noreply@, user's own,
+    // repo-public authors) on top of this — see redact-engine.ts.
+  },
+  {
+    id: "pii.phone.e164",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "Phone number (E.164 / common national formats; US/EU-biased)",
+    regex: /(?<![\w.])(\+?[1-9]\d{0,2}[ \-.]?\(?\d{2,4}\)?[ \-.]?\d{3,4}[ \-.]?\d{3,4})(?![\w.])/,
+    autoRedactable: true,
+    redactToken: "<REDACTED-PHONE>",
+    // A digit-only UUID's hyphen groups read as national phone formatting, and
+    // so do a county tax-map parcel ID (see looksLikeParcelId), vector
+    // coordinates (looksLikeDecimalCoordinates) and seed/nonce/timestamp JSON
+    // values (isNumericMetadataValue), GitHub Actions run and job ids in
+    // their id positions (isCiRunIdentifier), a short sha after
+    // review_loop_grant or review_loop_exception (isReviewLoopSha), and bare
+    // powers of two and hash/PRNG constants (isNumericConstant).
+    validate: (span, match) =>
+      !insideUuid(match) &&
+      span.replace(/\D/g, "").length >= 10 &&
+      !looksLikeCompactTimestamp(span) &&
+      !isNumericConstant(span) &&
+      !looksLikeParcelId(span, match) &&
+      !looksLikeDecimalCoordinates(span) &&
+      !isNumericMetadataValue(span, match) &&
+      !isCiRunIdentifier(span, match) &&
+      !isReviewLoopSha(span, match),
+  },
+  {
+    id: "pii.ssn",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "US Social Security Number",
+    regex: /\b(\d{3}-\d{2}-\d{4})\b/,
+    autoRedactable: true,
+    redactToken: "<REDACTED-SSN>",
+    // Reject the all-zero-octet placeholders SSNs never use.
+    validate: (span) => {
+      const [a, b, c] = span.split("-");
+      return a !== "000" && b !== "00" && c !== "0000" && a !== "666" && a[0] !== "9";
+    },
+  },
+  {
+    id: "pii.cc",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "Credit-card number (Luhn-valid)",
+    regex: /\b((?:\d[ \-]?){13,19})\b/,
+    autoRedactable: true,
+    redactToken: "<REDACTED-CC>",
+    // A 13-19 digit slice of a digit-only UUID or of a decimal number passes
+    // Luhn often enough to matter, and so does a compact YYYYMMDDHHMMSS stamp
+    // (an autoplan run id); the only 14-digit cards start with 3, a stamp with
+    // 1 or 2. All three context checks run before Luhn.
+    validate: (span, match) =>
+      !insideUuid(match) && !insideDecimalNumber(match) && !looksLikeCompactTimestamp(span.replace(/[ -]$/, "")) && luhnValid(span),
+  },
+  {
+    id: "pii.ip_public",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "Public IPv4 address",
+    regex: /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/,
+    validate: (span, match, opts) => isPublicIPv4(span) && !isDeclaredVersion(match) && !isVersionContext(match, opts?.sourcePath),
+  },
+  {
+    id: "pii.wallet",
+    tier: "MEDIUM",
+    category: "pii",
+    description: "Crypto wallet address (ETH/BTC)",
+    regex: /\b(0x[a-fA-F0-9]{40}|bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{25,39}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b/,
+    validate: (span) => looksLikeWallet(span),
+  },
+
+  // ===== MEDIUM — internal-leak =====
+  {
+    id: "internal.hostname",
+    tier: "MEDIUM",
+    category: "internal",
+    description: "Internal hostname (*.internal/.corp/.local/.prod/.staging)",
+    regex: /\b([a-z0-9][a-z0-9\-]*\.(?:internal|corp|local|lan|prod|staging))\b/i,
+    // `.env.local`, `CLAUDE.local.md` and friends are filenames, not hosts.
+    // See isDotenvFilename and isLocalConfigFilename. A property read in
+    // code (`config.prod`) is not a host either: see isPropertyRead (#3987).
+    validate: (_span, match, opts) =>
+      !isDotenvFilename(match) && !isLocalConfigFilename(match) && !isPropertyRead(match, opts?.sourcePath),
+  },
+  {
+    id: "internal.url_private",
+    tier: "MEDIUM",
+    category: "internal",
+    description: "localhost URL with a non-trivial path",
+    regex: /(https?:\/\/(?:localhost|127\.0\.0\.1):\d{2,5}\/[^\s)]+)/,
+  },
+
+  // ===== MEDIUM — legal / damaging =====
+  {
+    id: "legal.nda_marker",
+    tier: "MEDIUM",
+    category: "legal",
+    description: "Confidentiality / NDA marker",
+    regex: /\b(CONFIDENTIAL|UNDER NDA|ATTORNEY[- ]CLIENT|PRIVILEGED|DO NOT DISTRIBUTE|EYES ONLY)\b/,
+  },
+  {
+    id: "legal.named_criticism",
+    tier: "MEDIUM",
+    category: "legal",
+    description: "Negative judgment near a capitalized full name (semantic pass is primary)",
+    regex: /\b(incompetent|negligent|fraudulent|fraud|fired|terminated|harassed|underperforming)\b/i,
+    // Require a Capitalized Two-Word name within the window.
+    nearRegex: /\b[A-Z][a-z]+ [A-Z][a-z]+\b/,
+    nearWindow: 80,
+  },
+
+  // ===== LOW — surface only =====
+  {
+    id: "internal.user_path",
+    tier: "LOW",
+    category: "internal",
+    description: "Absolute path under a user home dir",
+    regex: /(\/(?:Users|home)\/[a-z][a-z0-9_\-]+\/[^\s)]*)/,
+  },
+  {
+    id: "hygiene.todo",
+    tier: "LOW",
+    category: "hygiene",
+    description: "TODO(owner) marker carried into the artifact",
+    regex: /\b(TODO\([^)]+\))/,
+  },
+];
+
+/** Lookup by id. */
+export const PATTERNS_BY_ID: Record<string, RedactPattern> = Object.fromEntries(
+  PATTERNS.map((p) => [p.id, p]),
+);
